@@ -3792,6 +3792,15 @@ static void vop_crtc_te_handler(struct drm_crtc *crtc)
 	vop = to_vop(crtc);
 
 	if (vop->mcu_timing.mcu_pix_total) {
+		if (VOP_CTRL_GET(vop, mcu_bypass)) {
+			// When sending MCU init sequence, the panel might sent TE signal even
+			// before the init sequence is done. This will result in mcu_frame_st set
+			// to 1 before bypass mode exit, and VOP will start sending frame data
+			// immediately at half frame when exiting bypass mode. This causes
+			// corrupted image.
+			// So, when in bypass mode, ignore this interrupt.
+			return;
+		}
 		VOP_CTRL_SET(vop, mcu_frame_st, 1);
 	} else {
 		/*
