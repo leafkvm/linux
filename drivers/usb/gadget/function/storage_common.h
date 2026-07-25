@@ -85,6 +85,55 @@ do {									\
 #define SS_WRITE_ERROR				0x030c02
 #define SS_WRITE_PROTECTED			0x072700
 
+
+#define CD_MINS                       80 /* max. minutes per CD */
+#define CD_SECS                       60 /* seconds per minute */
+#define CD_FRAMES                     75 /* frames per second */
+#define CD_FRAMESIZE                2048 /* bytes per frame, "cooked" mode */
+#define CD_MAX_BYTES       (CD_MINS * CD_SECS * CD_FRAMES * CD_FRAMESIZE)
+#define CD_MAX_SECTORS     (CD_MAX_BYTES / 512)
+
+#define MMC_PROFILE_NONE                0x0000
+#define MMC_PROFILE_CD_ROM              0x0008
+#define MMC_PROFILE_CD_R                0x0009
+#define MMC_PROFILE_CD_RW               0x000A
+#define MMC_PROFILE_DVD_ROM             0x0010
+#define MMC_PROFILE_DVD_R_SR            0x0011
+#define MMC_PROFILE_DVD_RAM             0x0012
+#define MMC_PROFILE_DVD_RW_RO           0x0013
+#define MMC_PROFILE_DVD_RW_SR           0x0014
+#define MMC_PROFILE_DVD_R_DL_SR         0x0015
+#define MMC_PROFILE_DVD_R_DL_JR         0x0016
+#define MMC_PROFILE_DVD_RW_DL           0x0017
+#define MMC_PROFILE_DVD_DDR             0x0018
+#define MMC_PROFILE_DVD_PLUS_RW         0x001A
+#define MMC_PROFILE_DVD_PLUS_R          0x001B
+#define MMC_PROFILE_DVD_PLUS_RW_DL      0x002A
+#define MMC_PROFILE_DVD_PLUS_R_DL       0x002B
+#define MMC_PROFILE_BD_ROM              0x0040
+#define MMC_PROFILE_BD_R_SRM            0x0041
+#define MMC_PROFILE_BD_R_RRM            0x0042
+#define MMC_PROFILE_BD_RE               0x0043
+#define MMC_PROFILE_HDDVD_ROM           0x0050
+#define MMC_PROFILE_HDDVD_R             0x0051
+#define MMC_PROFILE_HDDVD_RAM           0x0052
+#define MMC_PROFILE_HDDVD_RW            0x0053
+#define MMC_PROFILE_HDDVD_R_DL          0x0058
+#define MMC_PROFILE_HDDVD_RW_DL         0x005A
+#define MMC_PROFILE_INVALID             0xFFFF
+
+/*
+ * Maximum number of sectors of a CD using MSF (Minute-Second-Frame) addressing.
+ * The value is derived from the CD standard, where the maximum number of sectors
+ * is calculated as (255 minutes * 59 seconds * 74 frames per second). Each frame
+ * corresponds to one sector. The subtraction of (2 * 75) accounts for the lead-in
+ * and lead-out areas, which are not part of the usable data area.
+ * 
+ * This value is used to distinguish between CDs and DVDs. Images larger than this
+ * value are assumed to be DVDs or oversized CDs, which are handled as DVDs.
+ */
+#define CD_MAX_MSF_SECTORS	((255 * 59 * 74) - (2 * 75))
+
 #define SK(x)		((u8) ((x) >> 16))	/* Sense Key byte, etc. */
 #define ASC(x)		((u8) ((x) >> 8))
 #define ASCQ(x)		((u8) (x))
@@ -104,6 +153,7 @@ struct fsg_lun {
 	unsigned int	ro:1;
 	unsigned int	removable:1;
 	unsigned int	cdrom:1;
+	unsigned int	cd_as_dvd:1; /* Handle big CD as DVD if cdrom == 1 */
 	unsigned int	prevent_medium_removal:1;
 	unsigned int	registered:1;
 	unsigned int	info_valid:1;
