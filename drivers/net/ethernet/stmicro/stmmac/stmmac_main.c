@@ -2893,11 +2893,6 @@ static void stmmac_check_ether_addr(struct stmmac_priv *priv)
 		stmmac_get_umac_addr(priv, priv->hw, addr, 0);
 		if (is_valid_ether_addr(addr))
 			eth_hw_addr_set(priv->dev, addr);
-		else if (likely(priv->plat->get_eth_addr))
-			priv->plat->get_eth_addr(priv->plat->bsp_priv,
-						 addr);
-		if (is_valid_ether_addr(addr))
-			eth_hw_addr_set(priv->dev, addr);
 		else
 			eth_hw_addr_random(priv->dev);
 		dev_info(priv->device, "device MAC address %pM\n",
