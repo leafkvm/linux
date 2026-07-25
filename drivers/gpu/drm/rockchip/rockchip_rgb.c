@@ -568,10 +568,8 @@ static int rockchip_mcu_panel_init(struct rockchip_rgb *rgb)
 	mcu_panel->enable_gpio = devm_fwnode_gpiod_get_index(dev, &np_mcu_panel->fwnode,
 							     "enable", 0, GPIOD_ASIS,
 							     fwnode_get_name(&np_mcu_panel->fwnode));
-	if (IS_ERR(mcu_panel->enable_gpio)) {
-		DRM_DEV_ERROR(dev, "failed to find mcu panel enable GPIO\n");
-		return PTR_ERR(mcu_panel->enable_gpio);
-	}
+	if (IS_ERR(mcu_panel->enable_gpio))
+		mcu_panel->enable_gpio = NULL;
 
 	mcu_panel->reset_gpio = devm_fwnode_gpiod_get_index(dev, &np_mcu_panel->fwnode,
 							    "reset", 0, GPIOD_ASIS,
@@ -788,7 +786,8 @@ static int rockchip_mcu_panel_unprepare(struct drm_panel *panel)
 		return 0;
 
 	gpiod_direction_output(mcu_panel->reset_gpio, 1);
-	gpiod_direction_output(mcu_panel->enable_gpio, 0);
+	if (mcu_panel->enable_gpio)
+		gpiod_direction_output(mcu_panel->enable_gpio, 0);
 
 	if (mcu_panel->desc->delay.unprepare)
 		msleep(mcu_panel->desc->delay.unprepare);
@@ -806,7 +805,8 @@ static int rockchip_mcu_panel_prepare(struct drm_panel *panel)
 	if (mcu_panel->prepared)
 		return 0;
 
-	gpiod_direction_output(mcu_panel->enable_gpio, 1);
+	if (mcu_panel->enable_gpio)
+		gpiod_direction_output(mcu_panel->enable_gpio, 1);
 
 	delay = mcu_panel->desc->delay.prepare;
 	if (delay)
