@@ -1447,6 +1447,14 @@ config TOUCHSCREEN_ZINITIX
 	  To compile this driver as a module, choose M here: the
 	  module will be called zinitix.
 
+config TOUCHSCREEN_CST128A_CUST
+	tristate "CST128A Touchscreen"
+	depends on I2C
+	default n
+	help
+	  Say Y here if you have CST128A touch panel.
+	  If unsure, say N.
+	
 source "drivers/input/touchscreen/hxchipset/Kconfig"
 
 endif
