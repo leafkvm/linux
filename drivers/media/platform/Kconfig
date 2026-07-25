@@ -16,6 +16,20 @@ config V4L_PLATFORM_DRIVERS
 	help
 	  Say Y here to enable support for platform-specific V4L drivers.
 
+config VIDEO_HDMI_CSI_STUB
+	tristate "HDMI-to-CSI stub for userspace daemons"
+	depends on VIDEO_DEV
+	select MEDIA_CONTROLLER
+	select VIDEO_V4L2_SUBDEV_API
+	select V4L2_FWNODE
+	help
+	  V4L2 subdev stub that delegates HDMI-to-CSI bridge control to
+	  a userspace daemon via /dev/hdmi-csi-stub.  Designed for chips
+	  like the Lontium LT6911C whose control plane runs in userspace.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called hdmi_csi_stub.
+
 config SDR_PLATFORM_DRIVERS
 	bool "SDR platform devices"
 	depends on MEDIA_SDR_SUPPORT
