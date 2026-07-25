@@ -13,6 +13,7 @@
 #include <linux/phy/phy.h>
 #include <linux/pinctrl/consumer.h>
 #include <linux/gpio/consumer.h>
+#include <linux/timer.h>
 
 #include <video/of_display_timing.h>
 
@@ -161,6 +162,7 @@ struct rockchip_rgb {
 	bool support_psr;
 	const struct rockchip_rgb_funcs *funcs;
 	struct rockchip_drm_sub_dev sub_dev;
+	struct timer_list te_timer;
 };
 
 static inline struct rockchip_rgb *connector_to_rgb(struct drm_connector *c)
@@ -251,12 +253,17 @@ struct drm_connector_helper_funcs rockchip_rgb_connector_helper_funcs = {
 	.atomic_check = rockchip_rgb_connector_atomic_check,
 };
 
+// This is a hack fix: if panel is not present, TE interrupt will not fire.
+// In this case we fake an interrupt every 20ms.
+static const int te_timer_interval_ms = 25;
+
 static void rockchip_rgb_encoder_atomic_enable(struct drm_encoder *encoder,
 					       struct drm_atomic_state *state)
 {
 	struct rockchip_rgb *rgb = encoder_to_rgb(encoder);
 	struct drm_crtc *new_crtc;
 	struct drm_crtc_state *old_crtc_state;
+	struct rockchip_crtc_state *s;
 
 	new_crtc = drm_atomic_get_new_crtc_for_encoder(state, encoder);
 	if (!new_crtc)
@@ -280,6 +287,11 @@ static void rockchip_rgb_encoder_atomic_enable(struct drm_encoder *encoder,
 	if (rgb->panel) {
 		drm_panel_prepare(rgb->panel);
 		drm_panel_enable(rgb->panel);
+	}
+
+	s = to_rockchip_crtc_state(new_crtc->state);
+	if (s->soft_te) {
+		mod_timer(&rgb->te_timer, jiffies + msecs_to_jiffies(3 * te_timer_interval_ms));
 	}
 }
 
@@ -322,6 +334,8 @@ static void rockchip_rgb_encoder_atomic_disable(struct drm_encoder *encoder,
 
 		s->output_if &= ~(VOP_OUTPUT_IF_RGB | VOP_OUTPUT_IF_BT656 | VOP_OUTPUT_IF_BT1120);
 	}
+
+	del_timer_sync(&rgb->te_timer);
 }
 
 static int
@@ -541,10 +555,23 @@ static int rockchip_mcu_panel_parse_cmd_seq(struct device *dev,
 	return 0;
 }
 
+static void rockchip_mcu_te_timer_handler(struct timer_list *t)
+{
+	struct rockchip_rgb *rgb = from_timer(rgb, t, te_timer);
+	struct drm_encoder *encoder = &rgb->encoder;
+
+	if (encoder->crtc)
+		rockchip_drm_te_handle(encoder->crtc);
+
+	mod_timer(&rgb->te_timer, jiffies + msecs_to_jiffies(te_timer_interval_ms));
+}
+
 static irqreturn_t rockchip_mcu_te_irq_handler(int irq, void *dev_id)
 {
 	struct rockchip_rgb *rgb = (struct rockchip_rgb *)dev_id;
 	struct drm_encoder *encoder = &rgb->encoder;
+
+	mod_timer(&rgb->te_timer, jiffies + msecs_to_jiffies(te_timer_interval_ms));
 
 	if (encoder->crtc)
 		rockchip_drm_te_handle(encoder->crtc);
@@ -579,6 +606,7 @@ static int rockchip_mcu_panel_init(struct rockchip_rgb *rgb)
 		return PTR_ERR(mcu_panel->reset_gpio);
 	}
 
+	timer_setup(&rgb->te_timer, rockchip_mcu_te_timer_handler, 0);
 	mcu_panel->te_gpio = devm_fwnode_gpiod_get_index(dev, &np_mcu_panel->fwnode,
 							 "te", 0, GPIOD_IN,
 							 fwnode_get_name(&np_mcu_panel->fwnode));
@@ -1067,6 +1095,7 @@ static void rockchip_rgb_unbind(struct device *dev, struct device *master,
 				void *data)
 {
 	struct rockchip_rgb *rgb = dev_get_drvdata(dev);
+	del_timer_sync(&rgb->te_timer);
 
 	rockchip_rgb_drm_self_refresh_helper_cleanup(rgb);
 
