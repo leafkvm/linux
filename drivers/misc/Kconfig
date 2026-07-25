@@ -23,6 +23,13 @@ config LT7911D_FB_NOTIFIER
 	   Enable this configuration option to enable the FB notifier driver
 	   for Lontium LT7911D.
 
+config LEAFKVM_VIDEO_REG_ACCESS
+	tristate "LeafKVM Video Chip Register Access"
+	depends on I2C
+	help
+	   Enable this configuration option to enable the generic video-chip
+	   register access driver on LeafKVM.
+
 config SENSORS_LIS3LV02D
 	tristate
 	depends on INPUT
