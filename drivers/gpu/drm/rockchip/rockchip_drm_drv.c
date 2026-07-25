@@ -2412,6 +2412,8 @@ int rockchip_drm_panel_loader_protect(struct drm_panel *panel, bool on)
 }
 EXPORT_SYMBOL(rockchip_drm_panel_loader_protect);
 
+void drm_splash_register(struct drm_device *dev);
+
 static void rockchip_drm_fix_encoder_possible_clones(struct drm_encoder *encoder)
 {
 	struct drm_device *drm_dev = encoder->dev;
@@ -2530,6 +2532,10 @@ static int rockchip_drm_bind(struct device *dev)
 
 	rockchip_drm_error_event_init(drm_dev);
 	rockchip_clocks_loader_unprotect();
+
+#if IS_ENABLED(CONFIG_LEAFKVM_BOOTSPLASH)
+	drm_splash_register(drm_dev);
+#endif
 
 	return 0;
 err_drm_fbdev_fini:
