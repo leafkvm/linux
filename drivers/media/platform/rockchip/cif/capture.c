@@ -5731,6 +5731,12 @@ static int rkcif_queue_setup(struct vb2_queue *queue,
 	cif_fmt = stream->cif_fmt_out;
 	in_fmt = stream->cif_fmt_in;
 
+	if (!cif_fmt || !in_fmt) {
+		v4l2_err(&dev->v4l2_dev, "stream %d not configured, call S_FMT first\n",
+			 stream->id);
+		return -EINVAL;
+	}
+
 	*num_planes = cif_fmt->mplanes;
 
 	if (stream->crop_enable)
