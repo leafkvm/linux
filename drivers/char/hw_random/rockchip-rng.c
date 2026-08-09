@@ -391,8 +391,11 @@ static int rkrng_read(struct hwrng *rng, void *buf, size_t max, bool wait)
 				 ROCKCHIP_POLL_PERIOD_US,
 				 ROCKCHIP_POLL_TIMEOUT_US);
 
-	if (ret)
+	if (ret) {
+		dev_warn_ratelimited(rk_rng->dev,
+				     "timed out waiting for SW_DRNG_ACK\n");
 		goto exit;
+	}
 
 	rk_rng_writel(rk_rng, reg_ctrl, RKRNG_STATE);
 
@@ -511,21 +514,41 @@ static int rk_rng_probe(struct platform_device *pdev)
 	pm_runtime_use_autosuspend(&pdev->dev);
 	pm_runtime_enable(&pdev->dev);
 
-	ret = devm_hwrng_register(&pdev->dev, &rk_rng->rng);
-	if (ret) {
-		pm_runtime_dont_use_autosuspend(&pdev->dev);
-		pm_runtime_disable(&pdev->dev);
-	}
-
-	/* for some platform need hardware operation when probe */
+	/*
+	 * For some platform need hardware operation when probe.
+	 *
+	 * This must happen before devm_hwrng_register(): registering starts the
+	 * "hwrng" kthread and immediately reads the device from
+	 * add_early_randomness().  Resetting RKRNG_CTRL/RKRNG_STATE underneath
+	 * an in-flight read makes that read time out, and the hwrng core then
+	 * backs off for 10 seconds (hwrng_msleep()) before trying again -
+	 * which is exactly how long "random: crng init done" was delayed.
+	 */
 	if (rk_rng->soc_data->rk_rng_init) {
-		pm_runtime_get_sync(rk_rng->dev);
+		ret = pm_runtime_get_sync(rk_rng->dev);
+		if (ret < 0) {
+			pm_runtime_put_noidle(rk_rng->dev);
+			goto err_pm;
+		}
 
 		ret = rk_rng->soc_data->rk_rng_init(&rk_rng->rng);
 
 		pm_runtime_mark_last_busy(rk_rng->dev);
 		pm_runtime_put_sync_autosuspend(rk_rng->dev);
+
+		if (ret)
+			goto err_pm;
 	}
+
+	ret = devm_hwrng_register(&pdev->dev, &rk_rng->rng);
+	if (ret)
+		goto err_pm;
+
+	return 0;
+
+err_pm:
+	pm_runtime_dont_use_autosuspend(&pdev->dev);
+	pm_runtime_disable(&pdev->dev);
 
 	return ret;
 }
