@@ -3,8 +3,11 @@
  * Input driver for a switch detected via ADC voltage threshold
  *
  * Reports EV_SW events based on whether the ADC reading exceeds
- * a configurable voltage threshold. Designed to expose the same
- * UAPI as gpio-keys does for switches.
+ * a configurable voltage threshold, optionally bounded from above as
+ * well so the switch is "on" only inside a voltage window. A new state
+ * can be required to hold for several consecutive polls before it is
+ * reported. Designed to expose the same UAPI as gpio-keys does for
+ * switches.
  */
 
 #include <linux/iio/consumer.h>
@@ -19,8 +22,14 @@
 struct adc_switch_state {
 	struct iio_channel *channel;
 	u32 threshold_mv;
+	/* Upper bound of the "on" window; U32_MAX = none. */
+	u32 threshold_max_mv;
 	u32 code;
+	/* Consecutive polls a new state must hold for; 1 = report at once. */
+	u32 debounce_count;
 	int last_state;
+	int candidate_state;
+	u32 candidate_count;
 };
 
 static void adc_switch_poll(struct input_dev *input)
@@ -32,13 +41,28 @@ static void adc_switch_poll(struct input_dev *input)
 	if (unlikely(ret < 0))
 		return;
 
-	state = value > st->threshold_mv ? 1 : 0;
+	state = value > st->threshold_mv && value <= st->threshold_max_mv;
 
-	if (state != st->last_state) {
-		input_report_switch(input, st->code, state);
-		input_sync(input);
-		st->last_state = state;
+	if (state == st->last_state) {
+		/* Back to the reported state; drop any pending change. */
+		st->candidate_count = 0;
+		return;
 	}
+
+	if (state != st->candidate_state) {
+		st->candidate_state = state;
+		st->candidate_count = 1;
+	} else {
+		st->candidate_count++;
+	}
+
+	if (st->candidate_count < st->debounce_count)
+		return;
+
+	input_report_switch(input, st->code, state);
+	input_sync(input);
+	st->last_state = state;
+	st->candidate_count = 0;
 }
 
 static int adc_switch_probe(struct platform_device *pdev)
@@ -47,7 +71,7 @@ static int adc_switch_probe(struct platform_device *pdev)
 	struct adc_switch_state *st;
 	struct input_dev *input;
 	enum iio_chan_type type;
-	u32 threshold_uv, poll_interval;
+	u32 threshold_uv, threshold_max_uv, debounce_count, poll_interval;
 	int error;
 
 	st = devm_kzalloc(dev, sizeof(*st), GFP_KERNEL);
@@ -77,12 +101,41 @@ static int adc_switch_probe(struct platform_device *pdev)
 	}
 	st->threshold_mv = threshold_uv / 1000;
 
+	/*
+	 * Optional: above this the switch reads "off" again, turning the
+	 * single threshold into a window (threshold, threshold-max].
+	 */
+	st->threshold_max_mv = U32_MAX;
+	if (!device_property_read_u32(dev, "threshold-max-microvolt",
+				      &threshold_max_uv)) {
+		st->threshold_max_mv = threshold_max_uv / 1000;
+		if (st->threshold_max_mv <= st->threshold_mv) {
+			dev_err(dev, "threshold-max-microvolt must exceed threshold-microvolt\n");
+			return -EINVAL;
+		}
+	}
+
 	if (device_property_read_u32(dev, "linux,code", &st->code)) {
 		dev_err(dev, "Missing linux,code\n");
 		return -EINVAL;
 	}
 
+	/*
+	 * Optional: reject glitches by requiring the new state to be read
+	 * this many times in a row before it is reported.
+	 */
+	st->debounce_count = 1;
+	if (!device_property_read_u32(dev, "debounce-count", &debounce_count)) {
+		if (!debounce_count) {
+			dev_err(dev, "debounce-count must be non-zero\n");
+			return -EINVAL;
+		}
+		st->debounce_count = debounce_count;
+	}
+
 	st->last_state = -1;
+	st->candidate_state = -1;
+	st->candidate_count = 0;
 
 	input = devm_input_allocate_device(dev);
 	if (!input)
