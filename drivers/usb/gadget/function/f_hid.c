@@ -135,6 +135,7 @@ struct f_hidg {
 	 */
 	bool				suspended;
 	bool				dequeue_pending;
+	bool				wakeup_sent;
 
 	/* get report */
 	struct usb_request		*get_req;
@@ -581,6 +582,29 @@ static int hidg_queue_prepared(struct f_hidg *hidg, struct usb_request *req)
 	return status;
 }
 
+/*
+ * A report written while the bus is suspended is the user asking the
+ * host to wake up, if the configuration advertised remote wakeup. Once
+ * per suspend: the controller logs failures, and a host that refuses
+ * will refuse every retry until it resumes by itself.
+ */
+static void hidg_remote_wakeup(struct f_hidg *hidg)
+{
+	struct usb_composite_dev *cdev = hidg->func.config->cdev;
+	unsigned long flags;
+	bool send;
+
+	if (!cdev->suspended ||
+	    !(hidg->func.config->bmAttributes & USB_CONFIG_ATT_WAKEUP))
+		return;
+	spin_lock_irqsave(&hidg->write_spinlock, flags);
+	send = !hidg->wakeup_sent;
+	hidg->wakeup_sent = true;
+	spin_unlock_irqrestore(&hidg->write_spinlock, flags);
+	if (send)
+		usb_gadget_wakeup(cdev->gadget);
+}
+
 static void f_hidg_req_complete(struct usb_ep *ep, struct usb_request *req)
 {
 	struct f_hidg *hidg = (struct f_hidg *)ep->driver_data;
@@ -671,6 +695,7 @@ static ssize_t f_hidg_write_overwrite(struct f_hidg *hidg,
 	} else if (dequeue) {
 		usb_ep_dequeue(hidg->in_ep, dequeue);
 	}
+	hidg_remote_wakeup(hidg);
 	return count;
 }
 
@@ -684,6 +709,8 @@ static ssize_t f_hidg_write(struct file *file, const char __user *buffer,
 
 	if (hidg->overwrite)
 		return f_hidg_write_overwrite(hidg, buffer, count);
+
+	hidg_remote_wakeup(hidg);
 
 	spin_lock_irqsave(&hidg->write_spinlock, flags);
 
@@ -1246,6 +1273,7 @@ static void hidg_disable(struct usb_function *f)
 	hidg_slots_clear(hidg);
 	hidg->suspended = false;
 	hidg->dequeue_pending = false;
+	hidg->wakeup_sent = false;
 	spin_unlock_irqrestore(&hidg->write_spinlock, flags);
 }
 
@@ -1267,6 +1295,7 @@ static void hidg_resume(struct usb_function *f)
 
 	spin_lock_irqsave(&hidg->write_spinlock, flags);
 	hidg->suspended = false;
+	hidg->wakeup_sent = false;
 	if (hidg->overwrite && hidg->req && !hidg->write_pending)
 		next = hidg_load_parked(hidg);
 	spin_unlock_irqrestore(&hidg->write_spinlock, flags);
@@ -1359,6 +1388,7 @@ static int hidg_set_alt(struct usb_function *f, unsigned intf, unsigned alt)
 		hidg->write_pending = 0;
 		hidg->suspended = false;
 		hidg->dequeue_pending = false;
+		hidg->wakeup_sent = false;
 		spin_unlock_irqrestore(&hidg->write_spinlock, flags);
 
 		wake_up(&hidg->write_queue);

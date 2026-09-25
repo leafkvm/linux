@@ -24,5 +24,7 @@ Description:
 				any (a write with an undeclared ID fails with
 				EINVAL), else in one slot. Parked reports
 				survive a bus suspend; the host's first poll
-				after resume gets the newest state.
+				after resume gets the newest state, and a
+				write during a suspend requests a remote
+				wakeup if the configuration advertises it.
 		=============	============================================
