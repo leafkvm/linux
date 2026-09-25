@@ -27,6 +27,8 @@ struct f_hid_opts {
 	bool				report_desc_alloc;
 	unsigned char			interval;
 	bool				interval_user_set;
+	/* See f_hidg::overwrite. */
+	bool				overwrite;
 
 	/*
 	 * Protect the data form concurrent access by read/write

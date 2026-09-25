@@ -23,6 +23,8 @@
 #include "u_hid.h"
 
 #define HIDG_MINORS	4
+/* Report IDs tracked per function in overwrite mode. */
+#define HIDG_MAX_REPORT_IDS	32
 
 /*
  * Most operating systems seem to allow for 5000ms timeout, we will allow
@@ -52,6 +54,15 @@ struct f_hidg_req_list {
 	struct usb_request	*req;
 	unsigned int		pos;
 	struct list_head 	list;
+};
+
+/* One parked report in overwrite mode (see f_hidg::overwrite). */
+struct f_hidg_slot {
+	bool			valid;
+	u8			id;
+	unsigned int		len;
+	u64			seq;
+	char			*buf;
 };
 
 struct f_hidg {
@@ -93,6 +104,29 @@ struct f_hidg {
 	wait_queue_head_t		write_queue;
 	struct usb_request		*req;
 
+	/*
+	 * overwrite - a write while a report is in flight does not block
+	 *             (or fail with -EAGAIN): the report is parked and the
+	 *             completion chains it onto the endpoint, and a newer
+	 *             report replaces a parked one. The host therefore
+	 *             always polls the newest state, and a state device
+	 *             (keyboard, absolute pointer) can never be left holding
+	 *             a stale report — the property userspace cannot get by
+	 *             itself, since it has no way to replace a request
+	 *             already on the endpoint. Reports are parked per report
+	 *             ID when the descriptor declares any (one slot per ID,
+	 *             matched on the report's first byte), else in a single
+	 *             slot. Delta reports (relative motion) lose the deltas
+	 *             replaced while the host was not polling; that is the
+	 *             intended trade.
+	 */
+	bool				overwrite;
+	struct f_hidg_slot		*slots;
+	unsigned int			nslots;
+	/* Whether the descriptor uses report IDs (slots keyed by them). */
+	bool				report_ids;
+	u64				slot_seq;
+
 	/* get report */
 	struct usb_request		*get_req;
 	struct usb_hidg_report		get_report;
@@ -122,7 +156,13 @@ static inline struct f_hidg *func_to_hidg(struct usb_function *f)
 static void hidg_release(struct device *dev)
 {
 	struct f_hidg *hidg = container_of(dev, struct f_hidg, dev);
+	unsigned int i;
 
+	if (hidg->slots) {
+		for (i = 0; i < hidg->nslots; i++)
+			kfree(hidg->slots[i].buf);
+		kfree(hidg->slots);
+	}
 	kfree(hidg->report_desc);
 	kfree(hidg->set_report_buf);
 	kfree(hidg);
@@ -433,9 +473,109 @@ static ssize_t f_hidg_read(struct file *file, char __user *buffer,
 		return f_hidg_ssreport_read(file, buffer, count, ptr);
 }
 
+static void f_hidg_req_complete(struct usb_ep *ep, struct usb_request *req);
+
+/*-------------------------------------------------------------------------*/
+/*                       Overwrite mode: parked reports                    */
+
+/*
+ * The slot a report parks in: the one for its report ID (first byte)
+ * when the descriptor declares IDs, else the only one. NULL for an ID
+ * the descriptor does not declare. write_spinlock held.
+ */
+static struct f_hidg_slot *hidg_slot_for(struct f_hidg *hidg, u8 id)
+{
+	unsigned int i;
+
+	if (!hidg->report_ids)
+		return &hidg->slots[0];
+	for (i = 0; i < hidg->nslots; i++)
+		if (hidg->slots[i].id == id)
+			return &hidg->slots[i];
+	return NULL;
+}
+
+/* The oldest parked report, or NULL. write_spinlock held. */
+static struct f_hidg_slot *hidg_slot_oldest(struct f_hidg *hidg)
+{
+	struct f_hidg_slot *slot, *oldest = NULL;
+	unsigned int i;
+
+	for (i = 0; i < hidg->nslots; i++) {
+		slot = &hidg->slots[i];
+		if (slot->valid && (!oldest || slot->seq < oldest->seq))
+			oldest = slot;
+	}
+	return oldest;
+}
+
+/* write_spinlock held. */
+static void hidg_slots_clear(struct f_hidg *hidg)
+{
+	unsigned int i;
+
+	for (i = 0; i < hidg->nslots; i++)
+		hidg->slots[i].valid = false;
+}
+
+/* Fill the IN request with one report. write_spinlock held. */
+static void hidg_fill_req(struct f_hidg *hidg, struct usb_request *req,
+			  const void *data, unsigned int len)
+{
+	if (data != req->buf)
+		memcpy(req->buf, data, len);
+	req->status   = 0;
+	req->zero     = 1;
+	req->length   = len;
+	req->complete = f_hidg_req_complete;
+	req->context  = hidg;
+}
+
+/*
+ * Load the oldest parked report into the IN request and mark it pending.
+ * Returns the request to queue once the lock is dropped, or NULL when
+ * nothing is parked. write_spinlock held; requires !write_pending and a
+ * live hidg->req.
+ */
+static struct usb_request *hidg_load_parked(struct f_hidg *hidg)
+{
+	struct f_hidg_slot *slot = hidg_slot_oldest(hidg);
+	struct usb_request *req = hidg->req;
+
+	if (!slot)
+		return NULL;
+	hidg_fill_req(hidg, req, slot->buf, slot->len);
+	slot->valid = false;
+	hidg->write_pending = 1;
+	return req;
+}
+
+/*
+ * Queue a request prepared under the lock (write_pending already set);
+ * on failure release the pending flag so the next write goes direct.
+ */
+static int hidg_queue_prepared(struct f_hidg *hidg, struct usb_request *req)
+{
+	unsigned long flags;
+	int status;
+
+	if (!hidg->in_ep->enabled)
+		status = -ESHUTDOWN;
+	else
+		status = usb_ep_queue(hidg->in_ep, req, GFP_ATOMIC);
+	if (status < 0) {
+		spin_lock_irqsave(&hidg->write_spinlock, flags);
+		hidg->write_pending = 0;
+		spin_unlock_irqrestore(&hidg->write_spinlock, flags);
+		wake_up(&hidg->write_queue);
+	}
+	return status;
+}
+
 static void f_hidg_req_complete(struct usb_ep *ep, struct usb_request *req)
 {
 	struct f_hidg *hidg = (struct f_hidg *)ep->driver_data;
+	struct usb_request *next = NULL;
 	unsigned long flags;
 
 	if (req->status != 0) {
@@ -445,8 +585,70 @@ static void f_hidg_req_complete(struct usb_ep *ep, struct usb_request *req)
 
 	spin_lock_irqsave(&hidg->write_spinlock, flags);
 	hidg->write_pending = 0;
+	/*
+	 * Overwrite mode: chain the oldest parked report straight onto the
+	 * endpoint, unless the endpoint is going away (disable).
+	 */
+	if (hidg->overwrite && hidg->req &&
+	    req->status != -ESHUTDOWN && req->status != -ECONNABORTED)
+		next = hidg_load_parked(hidg);
 	spin_unlock_irqrestore(&hidg->write_spinlock, flags);
+
+	if (next)
+		hidg_queue_prepared(hidg, next);
 	wake_up(&hidg->write_queue);
+}
+
+static ssize_t f_hidg_write_overwrite(struct f_hidg *hidg,
+				      const char __user *buffer, size_t count)
+{
+	struct usb_request *req = NULL;
+	struct f_hidg_slot *slot;
+	unsigned long flags;
+	char *buf;
+	int status;
+
+	if (!count)
+		return 0;
+	count = min_t(size_t, count, hidg->report_length);
+	buf = memdup_user(buffer, count);
+	if (IS_ERR(buf))
+		return PTR_ERR(buf);
+
+	spin_lock_irqsave(&hidg->write_spinlock, flags);
+	if (!hidg->req) {
+		spin_unlock_irqrestore(&hidg->write_spinlock, flags);
+		kfree(buf);
+		return -ESHUTDOWN;
+	}
+	slot = hidg_slot_for(hidg, buf[0]);
+	if (!slot) {
+		/* The descriptor declares no such report ID. */
+		spin_unlock_irqrestore(&hidg->write_spinlock, flags);
+		kfree(buf);
+		return -EINVAL;
+	}
+	if (!hidg->write_pending) {
+		/* Endpoint idle: straight onto it, like the classic path. */
+		req = hidg->req;
+		hidg->write_pending = 1;
+		hidg_fill_req(hidg, req, buf, count);
+	} else {
+		/* In flight: park it; the completion chains it. */
+		memcpy(slot->buf, buf, count);
+		slot->len = count;
+		slot->seq = ++hidg->slot_seq;
+		slot->valid = true;
+	}
+	spin_unlock_irqrestore(&hidg->write_spinlock, flags);
+	kfree(buf);
+
+	if (req) {
+		status = hidg_queue_prepared(hidg, req);
+		if (status < 0)
+			return status;
+	}
+	return count;
 }
 
 static ssize_t f_hidg_write(struct file *file, const char __user *buffer,
@@ -456,6 +658,9 @@ static ssize_t f_hidg_write(struct file *file, const char __user *buffer,
 	struct usb_request *req;
 	unsigned long flags;
 	ssize_t status = -ENOMEM;
+
+	if (hidg->overwrite)
+		return f_hidg_write_overwrite(hidg, buffer, count);
 
 	spin_lock_irqsave(&hidg->write_spinlock, flags);
 
@@ -511,11 +716,7 @@ try_again:
 		goto try_again;
 	}
 
-	req->status   = 0;
-	req->zero     = 1;
-	req->length   = count;
-	req->complete = f_hidg_req_complete;
-	req->context  = hidg;
+	hidg_fill_req(hidg, req, req->buf, count);
 
 	spin_unlock_irqrestore(&hidg->write_spinlock, flags);
 
@@ -720,7 +921,8 @@ static __poll_t f_hidg_poll(struct file *file, poll_table *wait)
 	poll_wait(file, &hidg->get_queue, wait);
 	poll_wait(file, &hidg->get_id_queue, wait);
 
-	if (WRITE_COND)
+	/* Overwrite mode never blocks a write. */
+	if (hidg->overwrite || WRITE_COND)
 		ret |= EPOLLOUT | EPOLLWRNORM;
 
 	if (hidg->use_out_ep) {
@@ -1017,6 +1219,8 @@ static void hidg_disable(struct usb_function *f)
 	}
 
 	hidg->req = NULL;
+	/* The next enumeration starts from a clean state. */
+	hidg_slots_clear(hidg);
 	spin_unlock_irqrestore(&hidg->write_spinlock, flags);
 }
 
@@ -1383,6 +1587,7 @@ F_HID_OPT(subclass, 8, 255);
 F_HID_OPT(protocol, 8, 255);
 F_HID_OPT(no_out_endpoint, 8, 1);
 F_HID_OPT(report_length, 16, 65535);
+F_HID_OPT(overwrite, 8, 1);
 
 static ssize_t f_hid_opts_report_desc_show(struct config_item *item, char *page)
 {
@@ -1492,6 +1697,7 @@ static struct configfs_attribute *hid_attrs[] = {
 	&f_hid_opts_attr_report_length,
 	&f_hid_opts_attr_interval,
 	&f_hid_opts_attr_report_desc,
+	&f_hid_opts_attr_overwrite,
 	&f_hid_opts_attr_dev,
 	NULL,
 };
@@ -1592,6 +1798,66 @@ static void hidg_unbind(struct usb_configuration *c, struct usb_function *f)
 	usb_free_all_descriptors(f);
 }
 
+/*
+ * The report IDs the descriptor declares (Global item tag 8), in order
+ * of first appearance, at most @max of them. Returns the count.
+ */
+static unsigned int hidg_report_ids(const u8 *desc, unsigned int len,
+				    u8 *ids, unsigned int max)
+{
+	unsigned int n = 0, i = 0, size, j;
+	u8 prefix, id;
+
+	while (i < len) {
+		prefix = desc[i++];
+		if (prefix == 0xfe) {
+			/* Long item: bDataSize follows the prefix. */
+			if (i >= len)
+				break;
+			i += 2 + desc[i];
+			continue;
+		}
+		size = prefix & 0x3;
+		if (size == 3)
+			size = 4;
+		if (i + size > len)
+			break;
+		/* Report ID is Global (type 1) tag 8 with a one-byte value. */
+		if ((prefix & 0xfc) == 0x84 && size == 1) {
+			id = desc[i];
+			for (j = 0; j < n; j++)
+				if (ids[j] == id)
+					break;
+			if (j == n && n < max)
+				ids[n++] = id;
+		}
+		i += size;
+	}
+	return n;
+}
+
+/* Overwrite mode: one slot per declared report ID, else a single one. */
+static int hidg_alloc_slots(struct f_hidg *hidg)
+{
+	u8 ids[HIDG_MAX_REPORT_IDS];
+	unsigned int i, n;
+
+	n = hidg_report_ids(hidg->report_desc, hidg->report_desc_length, ids,
+			    ARRAY_SIZE(ids));
+	hidg->report_ids = n > 0;
+	hidg->nslots = n ? n : 1;
+	hidg->slots = kcalloc(hidg->nslots, sizeof(*hidg->slots), GFP_KERNEL);
+	if (!hidg->slots)
+		return -ENOMEM;
+	for (i = 0; i < hidg->nslots; i++) {
+		hidg->slots[i].id = n ? ids[i] : 0;
+		hidg->slots[i].buf = kmalloc(hidg->report_length, GFP_KERNEL);
+		if (!hidg->slots[i].buf)
+			return -ENOMEM; /* hidg_release frees the rest */
+	}
+	return 0;
+}
+
 static struct usb_function *hidg_alloc(struct usb_function_instance *fi)
 {
 	struct f_hidg *hidg;
@@ -1641,6 +1907,12 @@ static struct usb_function *hidg_alloc(struct usb_function_instance *fi)
 		}
 	}
 	hidg->use_out_ep = !opts->no_out_endpoint;
+	hidg->overwrite = opts->overwrite;
+	if (hidg->overwrite) {
+		ret = hidg_alloc_slots(hidg);
+		if (ret)
+			goto err_put_device;
+	}
 
 	++opts->refcnt;
 	mutex_unlock(&opts->lock);
