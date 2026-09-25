@@ -126,6 +126,15 @@ struct f_hidg {
 	/* Whether the descriptor uses report IDs (slots keyed by them). */
 	bool				report_ids;
 	u64				slot_seq;
+	/*
+	 * Bus suspended (function suspend/resume callbacks). Parked reports
+	 * are held for resume rather than chained behind a request the
+	 * host is not polling, and the first write pulls the stale in-flight
+	 * request so the host's first poll after resume sees the newest
+	 * state.
+	 */
+	bool				suspended;
+	bool				dequeue_pending;
 
 	/* get report */
 	struct usb_request		*get_req;
@@ -577,23 +586,26 @@ static void f_hidg_req_complete(struct usb_ep *ep, struct usb_request *req)
 	struct f_hidg *hidg = (struct f_hidg *)ep->driver_data;
 	struct usb_request *next = NULL;
 	unsigned long flags;
-
-	if (req->status != 0) {
-		ERROR(hidg->func.config->cdev,
-			"End Point Request ERROR: %d\n", req->status);
-	}
+	bool deliberate;
 
 	spin_lock_irqsave(&hidg->write_spinlock, flags);
+	deliberate = hidg->dequeue_pending && req->status == -ECONNRESET;
 	hidg->write_pending = 0;
+	hidg->dequeue_pending = false;
 	/*
 	 * Overwrite mode: chain the oldest parked report straight onto the
-	 * endpoint, unless the endpoint is going away (disable).
+	 * endpoint, unless the endpoint is going away (disable) or the bus
+	 * is suspended (hidg_resume queues it).
 	 */
-	if (hidg->overwrite && hidg->req &&
+	if (hidg->overwrite && hidg->req && !hidg->suspended &&
 	    req->status != -ESHUTDOWN && req->status != -ECONNABORTED)
 		next = hidg_load_parked(hidg);
 	spin_unlock_irqrestore(&hidg->write_spinlock, flags);
 
+	if (req->status != 0 && !deliberate) {
+		ERROR(hidg->func.config->cdev,
+			"End Point Request ERROR: %d\n", req->status);
+	}
 	if (next)
 		hidg_queue_prepared(hidg, next);
 	wake_up(&hidg->write_queue);
@@ -602,7 +614,7 @@ static void f_hidg_req_complete(struct usb_ep *ep, struct usb_request *req)
 static ssize_t f_hidg_write_overwrite(struct f_hidg *hidg,
 				      const char __user *buffer, size_t count)
 {
-	struct usb_request *req = NULL;
+	struct usb_request *req = NULL, *dequeue = NULL;
 	struct f_hidg_slot *slot;
 	unsigned long flags;
 	char *buf;
@@ -634,11 +646,20 @@ static ssize_t f_hidg_write_overwrite(struct f_hidg *hidg,
 		hidg->write_pending = 1;
 		hidg_fill_req(hidg, req, buf, count);
 	} else {
-		/* In flight: park it; the completion chains it. */
+		/* In flight: park it; the completion (or resume) chains it. */
 		memcpy(slot->buf, buf, count);
 		slot->len = count;
 		slot->seq = ++hidg->slot_seq;
 		slot->valid = true;
+		/*
+		 * Suspended with a stale report on the endpoint: pull it, so
+		 * the host's first poll after resume gets the newest state.
+		 * Once per suspend; later writes just replace the parked one.
+		 */
+		if (hidg->suspended && !hidg->dequeue_pending) {
+			hidg->dequeue_pending = true;
+			dequeue = hidg->req;
+		}
 	}
 	spin_unlock_irqrestore(&hidg->write_spinlock, flags);
 	kfree(buf);
@@ -647,6 +668,8 @@ static ssize_t f_hidg_write_overwrite(struct f_hidg *hidg,
 		status = hidg_queue_prepared(hidg, req);
 		if (status < 0)
 			return status;
+	} else if (dequeue) {
+		usb_ep_dequeue(hidg->in_ep, dequeue);
 	}
 	return count;
 }
@@ -1219,9 +1242,36 @@ static void hidg_disable(struct usb_function *f)
 	}
 
 	hidg->req = NULL;
-	/* The next enumeration starts from a clean state. */
+	/* The next enumeration starts from a clean, awake state. */
 	hidg_slots_clear(hidg);
+	hidg->suspended = false;
+	hidg->dequeue_pending = false;
 	spin_unlock_irqrestore(&hidg->write_spinlock, flags);
+}
+
+static void hidg_suspend(struct usb_function *f)
+{
+	struct f_hidg *hidg = func_to_hidg(f);
+	unsigned long flags;
+
+	spin_lock_irqsave(&hidg->write_spinlock, flags);
+	hidg->suspended = true;
+	spin_unlock_irqrestore(&hidg->write_spinlock, flags);
+}
+
+static void hidg_resume(struct usb_function *f)
+{
+	struct f_hidg *hidg = func_to_hidg(f);
+	struct usb_request *next = NULL;
+	unsigned long flags;
+
+	spin_lock_irqsave(&hidg->write_spinlock, flags);
+	hidg->suspended = false;
+	if (hidg->overwrite && hidg->req && !hidg->write_pending)
+		next = hidg_load_parked(hidg);
+	spin_unlock_irqrestore(&hidg->write_spinlock, flags);
+	if (next)
+		hidg_queue_prepared(hidg, next);
 }
 
 static int hidg_set_alt(struct usb_function *f, unsigned intf, unsigned alt)
@@ -1307,6 +1357,8 @@ static int hidg_set_alt(struct usb_function *f, unsigned intf, unsigned alt)
 		spin_lock_irqsave(&hidg->write_spinlock, flags);
 		hidg->req = req_in;
 		hidg->write_pending = 0;
+		hidg->suspended = false;
+		hidg->dequeue_pending = false;
 		spin_unlock_irqrestore(&hidg->write_spinlock, flags);
 
 		wake_up(&hidg->write_queue);
@@ -1923,6 +1975,8 @@ static struct usb_function *hidg_alloc(struct usb_function_instance *fi)
 	hidg->func.set_alt = hidg_set_alt;
 	hidg->func.disable = hidg_disable;
 	hidg->func.setup   = hidg_setup;
+	hidg->func.suspend = hidg_suspend;
+	hidg->func.resume  = hidg_resume;
 	hidg->func.free_func = hidg_free;
 
 	/* this could be made configurable at some point */

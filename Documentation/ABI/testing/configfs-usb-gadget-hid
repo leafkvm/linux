@@ -22,5 +22,7 @@ Description:
 				receives the latest state. Reports are parked
 				per report ID when the descriptor declares
 				any (a write with an undeclared ID fails with
-				EINVAL), else in one slot.
+				EINVAL), else in one slot. Parked reports
+				survive a bus suspend; the host's first poll
+				after resume gets the newest state.
 		=============	============================================
