@@ -10,4 +10,7 @@ Description:
 				except the data passed through /dev/hidg<N>
 		report_length	HID report length
 		subclass	HID device subclass to use
+		interval	endpoint bInterval, applied to every speed
+				(default: 10 at full speed, 4 at high and
+				super speed)
 		=============	============================================
