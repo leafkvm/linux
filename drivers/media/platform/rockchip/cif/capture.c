@@ -9229,11 +9229,9 @@ int rkcif_set_fmt(struct rkcif_stream *stream,
 void rkcif_stream_init(struct rkcif_device *dev, u32 id)
 {
 	struct rkcif_stream *stream = &dev->stream[id];
-	struct v4l2_pix_format_mplane pixm;
 	int i;
 
 	memset(stream, 0, sizeof(*stream));
-	memset(&pixm, 0, sizeof(pixm));
 	stream->id = id;
 	stream->cifdev = dev;
 
@@ -9247,11 +9245,7 @@ void rkcif_stream_init(struct rkcif_device *dev, u32 id)
 	stream->state = RKCIF_STATE_READY;
 	init_waitqueue_head(&stream->wq_stopped);
 
-	/* Set default format */
-	pixm.pixelformat = V4L2_PIX_FMT_NV12;
-	pixm.width = RKCIF_DEFAULT_WIDTH;
-	pixm.height = RKCIF_DEFAULT_HEIGHT;
-	rkcif_set_fmt(stream, &pixm, false);
+	/* The async notifier applies the format after creating media links. */
 
 	for (i = 0; i < CROP_SRC_MAX; i++) {
 		stream->crop[i].left = 0;

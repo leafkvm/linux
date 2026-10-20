@@ -275,8 +275,12 @@ int rkcif_scale_set_fmt(struct rkcif_scale_vdev *scale_vdev,
 	u32 height = 480;
 	int ret = 0;
 
-	if (!cif_dev->terminal_sensor.sd)
-		rkcif_update_sensor_info(&cif_dev->stream[0]);
+	/* During local initialization the stream has no pads or links yet. */
+	if (!cif_dev->terminal_sensor.sd && stream->vnode.vdev.entity.pads) {
+		ret = rkcif_update_sensor_info(&cif_dev->stream[0]);
+		if (ret)
+			return ret;
+	}
 
 	if (cif_dev->terminal_sensor.sd) {
 		fmt_src.which = V4L2_SUBDEV_FORMAT_ACTIVE;
