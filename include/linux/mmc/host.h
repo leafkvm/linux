@@ -311,6 +311,22 @@ struct mmc_ctx {
 	struct task_struct *task;
 };
 
+/*
+ * An SD card the bootloader left running, as the host node's boot-card-*
+ * properties describe it: selected, on a 4-bit bus, at @timing (an
+ * MMC_TIMING_* value) and, for SDR50/SDR104, with the host's sample
+ * point tuned. The first scan takes it over as it is (mmc_attach_sd_inherited)
+ * instead of powering it up and enumerating it.
+ */
+struct mmc_boot_card {
+	u32		rca;		/* relative card address */
+	u32		ocr;		/* the card's ACMD41 response */
+	unsigned char	timing;		/* MMC_TIMING_* the card is in */
+	const char	*note;		/* why it is short of SDR104, if given */
+	bool		valid;		/* described, and not taken over yet */
+	bool		inheriting;	/* takeover is configuring the host */
+};
+
 struct mmc_host {
 	struct device		*parent;
 	struct device		class_dev;
@@ -454,6 +470,8 @@ struct mmc_host {
 
 	int			rescan_disable;	/* disable card detection */
 	int			rescan_entered;	/* used with nonremovable devices */
+
+	struct mmc_boot_card	boot_card;	/* card left by the bootloader */
 
 	int			need_retune;	/* re-tuning is needed */
 	int			hold_retune;	/* hold off re-tuning */

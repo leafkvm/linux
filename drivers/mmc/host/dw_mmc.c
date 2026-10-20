@@ -1542,7 +1542,9 @@ static void dw_mci_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
 		/* Clear FIFO to avoid errors when reading small data during initialization. */
 		dw_mci_ctrl_reset(slot->host, SDMMC_CTRL_FIFO_RESET);
 #endif
-		if (dw_mci_get_cd(mmc) && !IS_ERR_OR_NULL(slot->host->pinctrl)) {
+		/* Keep the live bus connected while adopting the boot card. */
+		if (!mmc->boot_card.inheriting && dw_mci_get_cd(mmc) &&
+		    !IS_ERR_OR_NULL(slot->host->pinctrl)) {
 			if (!pinctrl_select_state(slot->host->pinctrl, slot->host->idle_state)) {
 				if (device_property_read_u32(slot->host->dev, "power-off-delay-ms",
 				    &power_off_delay))
@@ -1561,7 +1563,8 @@ static void dw_mci_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
 				return;
 			}
 		}
-		set_bit(DW_MMC_CARD_NEED_INIT, &slot->flags);
+		if (!mmc->boot_card.inheriting)
+			set_bit(DW_MMC_CARD_NEED_INIT, &slot->flags);
 		regs = mci_readl(slot->host, PWREN);
 		regs |= (1 << slot->id);
 		mci_writel(slot->host, PWREN, regs);
@@ -3524,10 +3527,12 @@ static struct dw_mci_board *dw_mci_parse_dt(struct dw_mci *host)
 		if (IS_ERR(host->idle_state))
 			dev_warn(dev, "No idle pinctrl state\n");
 
-		if (!IS_ERR(host->normal_state) && !IS_ERR(host->idle_state))
-			pinctrl_select_state(host->pinctrl, host->idle_state);
-		else
+		if (!IS_ERR(host->normal_state) && !IS_ERR(host->idle_state)) {
+			if (!device_property_present(dev, "boot-card-rca"))
+				pinctrl_select_state(host->pinctrl, host->idle_state);
+		} else {
 			host->pinctrl = NULL;
+		}
 	}
 
 	return pdata;
@@ -3628,7 +3633,9 @@ int dw_mci_probe(struct dw_mci *host)
 		goto err_clk_ciu;
 	}
 
-	if (host->pdata->rstc) {
+	/* Preserve the sample phase of a card left running by the bootloader. */
+	if (host->pdata->rstc &&
+	    !device_property_present(host->dev, "boot-card-rca")) {
 		reset_control_assert(host->pdata->rstc);
 		usleep_range(10, 50);
 		reset_control_deassert(host->pdata->rstc);

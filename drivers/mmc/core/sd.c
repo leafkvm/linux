@@ -1926,3 +1926,200 @@ err:
 
 	return err;
 }
+
+/* CMD10 to an addressed card in stand-by (CMD2 only reaches cards in ready). */
+static int mmc_sd_send_cid(struct mmc_card *card, u32 *cid)
+{
+	struct mmc_command cmd = {};
+	int err;
+
+	cmd.opcode = MMC_SEND_CID;
+	cmd.arg = card->rca << 16;
+	cmd.flags = MMC_RSP_R2 | MMC_CMD_AC;
+
+	err = mmc_wait_for_cmd(card->host, &cmd, MMC_CMD_RETRIES);
+	if (err)
+		return err;
+
+	memcpy(cid, cmd.resp, sizeof(u32) * 4);
+	return 0;
+}
+
+/*
+ * Take over the SD card the bootloader left running (host->boot_card):
+ * selected, in the transfer state, on a 4-bit bus, at the timing named,
+ * and at SDR50/SDR104 with the host's sample point already tuned. Nothing
+ * that would reset or retune it is repeated — no power-up, CMD0, ACMD41,
+ * CMD11 or tuning. What is read is what the kernel needs to know the
+ * card by: CSD and CID (CMD9/CMD10, the card briefly deselected), then
+ * SCR, SD status and switch caps at the inherited timing, which also
+ * proves that timing works. On any failure the host is powered off and
+ * the card is left to the normal scan.
+ */
+int mmc_attach_sd_inherited(struct mmc_host *host)
+{
+	const struct mmc_boot_card *bc = &host->boot_card;
+	unsigned char timing = bc->timing;
+	unsigned int bus_speed = 0, max_dtr;
+	struct mmc_card *card = NULL;
+	u32 cid[4], rocr;
+	bool uhs;
+	const char *stage = "power setup";
+	int err;
+
+	WARN_ON(!host->claimed);
+
+	uhs = timing >= MMC_TIMING_UHS_SDR12 && timing <= MMC_TIMING_UHS_DDR50;
+
+	/* Hosts the takeover cannot describe go the normal way. */
+	if (host->pwrseq || mmc_host_is_spi(host) ||
+	    host->caps2 & (MMC_CAP2_NO_SD | MMC_CAP2_FULL_PWR_CYCLE) ||
+	    !(host->caps & MMC_CAP_4_BIT_DATA) ||
+	    (uhs && !mmc_host_uhs(host)))
+		return -EINVAL;
+
+	switch (timing) {
+	case MMC_TIMING_UHS_SDR104:
+		bus_speed = UHS_SDR104_BUS_SPEED;
+		max_dtr = UHS_SDR104_MAX_DTR;
+		break;
+	case MMC_TIMING_UHS_SDR50:
+		bus_speed = UHS_SDR50_BUS_SPEED;
+		max_dtr = UHS_SDR50_MAX_DTR;
+		break;
+	case MMC_TIMING_UHS_SDR25:
+		bus_speed = UHS_SDR25_BUS_SPEED;
+		max_dtr = UHS_SDR25_MAX_DTR;
+		break;
+	case MMC_TIMING_UHS_SDR12:
+		bus_speed = UHS_SDR12_BUS_SPEED;
+		max_dtr = UHS_SDR12_MAX_DTR;
+		break;
+	case MMC_TIMING_SD_HS:
+		max_dtr = HIGH_SPEED_MAX_DTR;
+		break;
+	default:
+		max_dtr = DEFAULT_SPEED_MAX_DTR;
+		break;
+	}
+
+	if (host->ocr_avail_sd)
+		host->ocr_avail = host->ocr_avail_sd;
+
+	err = mmc_power_up_inherited(host, timing, min(max_dtr, host->f_max));
+	if (err)
+		goto power_off;
+
+	mmc_attach_bus(host, &mmc_sd_ops);
+
+	stage = "select voltage";
+	rocr = mmc_select_voltage(host, bc->ocr & ~0x7FFF);
+	if (!rocr) {
+		err = -EINVAL;
+		goto detach;
+	}
+
+	stage = "allocate card";
+	card = mmc_alloc_card(host, &sd_type);
+	if (IS_ERR(card)) {
+		err = PTR_ERR(card);
+		card = NULL;
+		goto detach;
+	}
+	card->ocr = rocr;
+	card->type = MMC_TYPE_SD;
+	card->rca = bc->rca;
+
+	/* CSD and CID are only sent in stand-by. */
+	stage = "CMD7 deselect";
+	err = mmc_deselect_cards(host);
+	if (err)
+		goto free_card;
+
+	stage = "CMD10 CID";
+	err = mmc_sd_send_cid(card, cid);
+	if (err)
+		goto free_card;
+	memcpy(card->raw_cid, cid, sizeof(card->raw_cid));
+
+	if (host->ops->init_card)
+		host->ops->init_card(host, card);
+
+	stage = "CMD9 CSD";
+	err = mmc_sd_get_csd(card);
+	if (err)
+		goto free_card;
+	mmc_decode_cid(card);
+
+	stage = "CMD7 select";
+	err = mmc_select_card(card);
+	if (err)
+		goto free_card;
+
+	mmc_fixup_device(card, mmc_sd_fixups);
+
+	stage = "read SCR/SSR/switch capabilities";
+	err = mmc_sd_setup_card(host, card, false);
+	if (err)
+		goto free_card;
+
+	if (uhs) {
+		/*
+		 * Only a card at 1.8 V reports the 1.8 V-only bus speeds: the
+		 * check that the card is where the bootloader said it is.
+		 */
+		stage = "validate UHS timing";
+		if (!mmc_sd_card_using_v18(card) ||
+		    !(card->sw_caps.sd3_bus_mode & (1 << bus_speed))) {
+			err = -EINVAL;
+			goto free_card;
+		}
+		card->sd_bus_speed = bus_speed;
+		card->sw_caps.uhs_max_dtr = max_dtr;
+
+		/* Tuned by the bootloader; re-tune on errors from here on. */
+		if (host->ops->execute_tuning &&
+		    (timing == MMC_TIMING_UHS_SDR50 ||
+		     timing == MMC_TIMING_UHS_SDR104))
+			mmc_retune_enable(host);
+	}
+
+	stage = "read extension registers";
+	err = sd_read_ext_regs(card);
+	if (err)
+		goto free_card;
+
+	if (card->ext_perf.feature_support & SD_EXT_PERF_CACHE) {
+		stage = "enable cache";
+		err = sd_enable_cache(card);
+		if (err)
+			goto free_card;
+	}
+
+	host->card = card;
+	mmc_release_host(host);
+	stage = "register card";
+	err = mmc_add_card(card);
+	mmc_claim_host(host);
+	if (err) {
+		host->card = NULL;
+		goto free_card;
+	}
+
+	pr_info("%s: card %04x taken over from the bootloader\n",
+		mmc_hostname(host), card->rca);
+	if (bc->note)
+		pr_warn("%s: bootloader left the card short of SDR104: %s\n",
+			mmc_hostname(host), bc->note);
+	return 0;
+
+free_card:
+	mmc_remove_card(card);
+detach:
+	mmc_detach_bus(host);
+power_off:
+	mmc_power_off(host);
+	pr_warn("%s: could not take over the card from the bootloader during %s (%d)\n",
+		mmc_hostname(host), stage, err);
+	return err;
+}

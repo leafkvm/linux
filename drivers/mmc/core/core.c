@@ -1361,6 +1361,40 @@ void mmc_power_up(struct mmc_host *host, u32 ocr)
 	mmc_delay(host->ios.power_delay_ms);
 }
 
+/*
+ * Power up a host whose card the bootloader left running (host->boot_card):
+ * the ios the card is already in, set in one go — no power-up delays, no
+ * 3.3 V initial signal voltage, no identification clock — so the host
+ * keeps the clock phases it was left with. The first set_ios already
+ * carries the card's timing, which on dw_mmc-rockchip is what keeps the
+ * tuned sample phase (it resets that phase only at legacy/HS timings).
+ */
+int mmc_power_up_inherited(struct mmc_host *host, unsigned char timing,
+			   unsigned int clock)
+{
+	bool uhs = timing >= MMC_TIMING_UHS_SDR12 &&
+		   timing <= MMC_TIMING_UHS_DDR50;
+
+	host->ios.vdd = fls(host->ocr_avail) - 1;
+	host->ios.chip_select = MMC_CS_DONTCARE;
+	host->ios.bus_mode = MMC_BUSMODE_PUSHPULL;
+	host->ios.bus_width = MMC_BUS_WIDTH_4;
+	host->ios.timing = timing;
+	host->ios.drv_type = 0;
+	host->ios.clock = clock;
+	host->ios.power_mode = MMC_POWER_UP;
+	mmc_set_ios(host);
+
+	if (mmc_set_signal_voltage(host, uhs ? MMC_SIGNAL_VOLTAGE_180 :
+						MMC_SIGNAL_VOLTAGE_330))
+		return -EIO;
+
+	host->ios.power_mode = MMC_POWER_ON;
+	mmc_set_ios(host);
+
+	return 0;
+}
+
 void mmc_power_off(struct mmc_host *host)
 {
 	if (host->ios.power_mode == MMC_POWER_OFF)
@@ -2251,6 +2285,23 @@ void mmc_rescan(struct work_struct *work)
 		goto out;
 	}
 
+	/*
+	 * A card the bootloader left running is taken over as it is, on the
+	 * first scan only; if that fails it is scanned like any other.
+	 */
+	if (host->boot_card.valid) {
+		int err;
+
+		host->boot_card.valid = false;
+		host->boot_card.inheriting = true;
+		err = mmc_attach_sd_inherited(host);
+		host->boot_card.inheriting = false;
+		if (!err) {
+			mmc_release_host(host);
+			goto out;
+		}
+	}
+
 	for (i = 0; i < ARRAY_SIZE(freqs); i++) {
 		unsigned int freq = freqs[i];
 		if (freq > host->f_max) {
@@ -2281,7 +2332,8 @@ void mmc_start_host(struct mmc_host *host)
 	host->f_init = max(min(freqs[0], host->f_max), host->f_min);
 	host->rescan_disable = 0;
 
-	if (!(host->caps2 & MMC_CAP2_NO_PRESCAN_POWERUP)) {
+	if (!(host->caps2 & MMC_CAP2_NO_PRESCAN_POWERUP) &&
+	    !host->boot_card.valid) {
 		mmc_claim_host(host);
 		mmc_power_up(host, host->ocr_avail);
 		mmc_release_host(host);

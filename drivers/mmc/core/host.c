@@ -263,6 +263,49 @@ mmc_of_parse_clk_phase(struct mmc_host *host, struct mmc_clk_phase_map *map)
 }
 EXPORT_SYMBOL(mmc_of_parse_clk_phase);
 
+/*
+ * The SD card a bootloader left running: boot-card-rca and boot-card-ocr
+ * (u32), boot-card-timing (the sd-uhs-* capability names, or "sd-hs" /
+ * "sd-default"), and optionally boot-card-note (why that timing is short
+ * of SDR104). All but the note have to be there for any of it to count.
+ */
+static void mmc_of_parse_boot_card(struct mmc_host *host)
+{
+	static const struct {
+		const char *name;
+		unsigned char timing;
+	} timings[] = {
+		{ "sd-default",		MMC_TIMING_LEGACY },
+		{ "sd-hs",		MMC_TIMING_SD_HS },
+		{ "sd-uhs-sdr12",	MMC_TIMING_UHS_SDR12 },
+		{ "sd-uhs-sdr25",	MMC_TIMING_UHS_SDR25 },
+		{ "sd-uhs-sdr50",	MMC_TIMING_UHS_SDR50 },
+		{ "sd-uhs-sdr104",	MMC_TIMING_UHS_SDR104 },
+	};
+	struct mmc_boot_card *bc = &host->boot_card;
+	struct device *dev = host->parent;
+	const char *timing;
+	int i;
+
+	if (device_property_read_u32(dev, "boot-card-rca", &bc->rca) ||
+	    device_property_read_u32(dev, "boot-card-ocr", &bc->ocr) ||
+	    device_property_read_string(dev, "boot-card-timing", &timing))
+		return;
+
+	for (i = 0; i < ARRAY_SIZE(timings); i++)
+		if (!strcmp(timing, timings[i].name))
+			break;
+	if (i == ARRAY_SIZE(timings)) {
+		dev_warn(dev, "unknown boot-card-timing \"%s\"\n", timing);
+		return;
+	}
+
+	bc->timing = timings[i].timing;
+	if (device_property_read_string(dev, "boot-card-note", &bc->note))
+		bc->note = NULL;
+	bc->valid = true;
+}
+
 /**
  * mmc_of_parse() - parse host's device properties
  * @host: host whose properties should be parsed.
@@ -305,6 +348,8 @@ int mmc_of_parse(struct mmc_host *host)
 
 	/* f_max is obtained from the optional "max-frequency" property */
 	device_property_read_u32(dev, "max-frequency", &host->f_max);
+
+	mmc_of_parse_boot_card(host);
 
 	/*
 	 * Configure CD and WP pins. They are both by default active low to
