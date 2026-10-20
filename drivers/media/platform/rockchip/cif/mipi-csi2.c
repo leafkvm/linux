@@ -436,6 +436,7 @@ static int csi2_media_init(struct v4l2_subdev *sd)
 	csi2->crop.height = RKCIF_DEFAULT_HEIGHT;
 	csi2->mbus.bus.mipi_csi2.num_data_lanes = 4;
 
+	sd->entity.function = MEDIA_ENT_F_VID_IF_BRIDGE;
 	return media_entity_pads_init(&sd->entity, num_pads, csi2->pad);
 }
 
