@@ -718,8 +718,8 @@ static int rockchip_fephy_probe(struct phy_device *phydev)
 	if (device_property_read_u32(&phydev->mdio.dev, "clock-frequency", &priv->clk_rate))
 		priv->clk_rate = 24000000;
 
-	priv->wol_irq = platform_get_irq_byname_optional(to_platform_device(&phydev->mdio.dev),
-							 "wol_irq");
+	/* An MDIO device is not a platform_device. Read its firmware node. */
+	priv->wol_irq = fwnode_irq_get_byname(dev_fwnode(&phydev->mdio.dev), "wol_irq");
 	if (priv->wol_irq == -EPROBE_DEFER)
 		return priv->wol_irq;
 
