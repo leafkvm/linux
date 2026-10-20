@@ -2990,8 +2990,7 @@ static struct rk_priv_data *rk_gmac_setup(struct platform_device *pdev,
 	ret = of_property_read_u32(dev->of_node, "tx_delay", &value);
 	if (ret) {
 		bsp_priv->tx_delay = -1;
-		dev_err(dev, "Can not read property: tx_delay.");
-		dev_err(dev, "set tx_delay to 0x%x\n",
+		dev_dbg(dev, "set tx_delay to 0x%x\n",
 			bsp_priv->tx_delay);
 	} else {
 		dev_info(dev, "TX delay(0x%x).\n", value);
@@ -3001,8 +3000,7 @@ static struct rk_priv_data *rk_gmac_setup(struct platform_device *pdev,
 	ret = of_property_read_u32(dev->of_node, "rx_delay", &value);
 	if (ret) {
 		bsp_priv->rx_delay = -1;
-		dev_err(dev, "Can not read property: rx_delay.");
-		dev_err(dev, "set rx_delay to 0x%x\n",
+		dev_dbg(dev, "set rx_delay to 0x%x\n",
 			bsp_priv->rx_delay);
 	} else {
 		dev_info(dev, "RX delay(0x%x).\n", value);
