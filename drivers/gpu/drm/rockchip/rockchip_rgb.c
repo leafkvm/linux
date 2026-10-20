@@ -109,6 +109,7 @@ struct rockchip_mcu_panel_desc {
 	struct drm_display_mode *mode;
 	struct mcu_cmd_seq *init_seq;
 	struct mcu_cmd_seq *exit_seq;
+	struct mcu_cmd_seq *handoff_seq;
 
 	struct {
 		unsigned int width;
@@ -142,6 +143,7 @@ struct rockchip_mcu_panel {
 
 	bool prepared;
 	bool enabled;
+	bool bootloader_initialized;
 };
 
 struct rockchip_rgb {
@@ -591,6 +593,7 @@ static int rockchip_mcu_panel_init(struct rockchip_rgb *rgb)
 	int ret;
 	u32 bus_flags;
 	u32 val;
+	const char *boot_panel;
 
 	mcu_panel->enable_gpio = devm_fwnode_gpiod_get_index(dev, &np_mcu_panel->fwnode,
 							     "enable", 0, GPIOD_ASIS,
@@ -680,6 +683,34 @@ static int rockchip_mcu_panel_init(struct rockchip_rgb *rgb)
 		if (ret < 0) {
 			DRM_DEV_ERROR(dev, "failed to parse exit sequence\n");
 			return ret;
+		}
+	}
+
+	/* Only a matching bootloader may authorize the first reset-free
+	 * prepare. GPIO acquisition above uses GPIOD_ASIS to preserve reset.
+	 * A missing marker/sequence or an asserted reset uses the cold path.
+	 */
+	data = of_get_property(np_mcu_panel, "panel-handoff-sequence", &len);
+	if (data && len > 0 &&
+	    of_property_read_bool(np_mcu_panel, "boot-panel-initialized") &&
+	    !of_property_read_string(np_mcu_panel, "boot-panel-compatible", &boot_panel) &&
+	    !strcmp(boot_panel, "st7789-rgb666-v1") &&
+	    gpiod_get_direction(mcu_panel->reset_gpio) == 0 &&
+	    gpiod_get_value_cansleep(mcu_panel->reset_gpio) == 0 &&
+	    (!mcu_panel->enable_gpio ||
+	     gpiod_get_value_cansleep(mcu_panel->enable_gpio) == 1)) {
+		mcu_panel->desc->handoff_seq = devm_kzalloc(dev,
+					sizeof(*mcu_panel->desc->handoff_seq), GFP_KERNEL);
+		if (!mcu_panel->desc->handoff_seq)
+			return -ENOMEM;
+
+		ret = rockchip_mcu_panel_parse_cmd_seq(dev, data, len,
+						     mcu_panel->desc->handoff_seq);
+		if (ret < 0) {
+			dev_warn(dev, "invalid panel handoff sequence; using full initialization\n");
+		} else {
+			mcu_panel->bootloader_initialized = true;
+			mcu_panel->prepared = true;
 		}
 	}
 
@@ -810,6 +841,7 @@ static int rockchip_mcu_panel_unprepare(struct drm_panel *panel)
 {
 	struct rockchip_mcu_panel *mcu_panel = to_rockchip_mcu_panel(panel);
 
+	mcu_panel->bootloader_initialized = false;
 	if (!mcu_panel->prepared)
 		return 0;
 
@@ -833,6 +865,7 @@ static int rockchip_mcu_panel_prepare(struct drm_panel *panel)
 	if (mcu_panel->prepared)
 		return 0;
 
+	dev_dbg(panel->dev, "resetting MCU panel\n");
 	if (mcu_panel->enable_gpio)
 		gpiod_direction_output(mcu_panel->enable_gpio, 1);
 
@@ -858,18 +891,25 @@ static int rockchip_mcu_panel_prepare(struct drm_panel *panel)
 static int rockchip_mcu_panel_enable(struct drm_panel *panel)
 {
 	struct rockchip_mcu_panel *mcu_panel = to_rockchip_mcu_panel(panel);
+	bool inherited = mcu_panel->bootloader_initialized;
 	int ret = 0;
 
 	if (mcu_panel->enabled)
 		return 0;
 
-	ret = rockchip_mcu_panel_xfer_mcu_cmd_seq(mcu_panel, mcu_panel->desc->init_seq);
+	dev_dbg(panel->dev, "%s MCU panel sequence\n",
+		inherited ? "handoff" : "full initialization");
+	ret = rockchip_mcu_panel_xfer_mcu_cmd_seq(mcu_panel,
+		inherited ? mcu_panel->desc->handoff_seq : mcu_panel->desc->init_seq);
 	if (ret)
 		DRM_DEV_ERROR(panel->dev, "failed to send init cmds seq\n");
 
-	if (mcu_panel->desc->delay.enable)
+	if (!inherited && mcu_panel->desc->delay.enable)
 		msleep(mcu_panel->desc->delay.enable);
 
+	if (inherited)
+		dev_info(panel->dev, "inherited initialized MCU panel from bootloader\n");
+	mcu_panel->bootloader_initialized = false;
 	mcu_panel->enabled = true;
 
 	return 0;
