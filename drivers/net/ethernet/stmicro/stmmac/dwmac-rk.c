@@ -2721,15 +2721,15 @@ static int rk_gmac_clk_init(struct plat_stmmacenet_data *plat)
 
 	bsp_priv->clk_enabled = false;
 
-	bsp_priv->mac_clk_rx = devm_clk_get(dev, "mac_clk_rx");
+	bsp_priv->mac_clk_rx = devm_clk_get_optional(dev, "mac_clk_rx");
 	if (IS_ERR(bsp_priv->mac_clk_rx))
-		dev_err(dev, "cannot get clock %s\n",
-			"mac_clk_rx");
+		return dev_err_probe(dev, PTR_ERR(bsp_priv->mac_clk_rx),
+				     "cannot get clock mac_clk_rx\n");
 
-	bsp_priv->mac_clk_tx = devm_clk_get(dev, "mac_clk_tx");
+	bsp_priv->mac_clk_tx = devm_clk_get_optional(dev, "mac_clk_tx");
 	if (IS_ERR(bsp_priv->mac_clk_tx))
-		dev_err(dev, "cannot get clock %s\n",
-			"mac_clk_tx");
+		return dev_err_probe(dev, PTR_ERR(bsp_priv->mac_clk_tx),
+				     "cannot get clock mac_clk_tx\n");
 
 	bsp_priv->aclk_mac = devm_clk_get(dev, "aclk_mac");
 	if (IS_ERR(bsp_priv->aclk_mac))
@@ -2769,9 +2769,10 @@ static int rk_gmac_clk_init(struct plat_stmmacenet_data *plat)
 			dev_err(dev, "cannot get clock %s\n", "clk_xpcs_eee");
 	}
 
-	bsp_priv->clk_mac_speed = devm_clk_get(dev, "clk_mac_speed");
+	bsp_priv->clk_mac_speed = devm_clk_get_optional(dev, "clk_mac_speed");
 	if (IS_ERR(bsp_priv->clk_mac_speed))
-		dev_err(dev, "cannot get clock %s\n", "clk_mac_speed");
+		return dev_err_probe(dev, PTR_ERR(bsp_priv->clk_mac_speed),
+				     "cannot get clock clk_mac_speed\n");
 
 	if (bsp_priv->clock_input) {
 		dev_info(dev, "clock input from PHY\n");
