@@ -1760,11 +1760,25 @@ int rkcif_get_linetime(struct rkcif_stream *stream)
 {
 	struct rkcif_device *cif_dev = stream->cifdev;
 	struct rkcif_sensor_info *sensor = &cif_dev->terminal_sensor;
+	struct v4l2_dv_timings timings;
 	u32 numerator, denominator;
 	u32 def_fps = 0;
 	int line_time = 0;
 	int vblank_def = 0;
 	int vblank_curr = 0;
+	int ret;
+
+	/* HDMI receivers report video timings rather than sensor VBLANK. */
+	ret = v4l2_subdev_call(sensor->sd, video, g_dv_timings, &timings);
+	if (!ret) {
+		if (timings.type != V4L2_DV_BT_656_1120 ||
+		    !timings.bt.pixelclock)
+			return -EINVAL;
+		return div64_u64((u64)V4L2_DV_BT_FRAME_WIDTH(&timings.bt) *
+				 NSEC_PER_SEC, timings.bt.pixelclock);
+	}
+	if (ret != -ENOIOCTLCMD && ret != -ENOTTY)
+		return ret;
 
 	numerator = sensor->src_fi.interval.numerator;
 	denominator = sensor->src_fi.interval.denominator;
