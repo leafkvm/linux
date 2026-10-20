@@ -1273,6 +1273,45 @@ static int rknpu_get_invalid_core_mask(struct device *dev)
 	return (int)invalid_core_mask;
 }
 
+static void __iomem *rv1126b_rknpu_ioremap(struct device *dev,
+					 struct resource *res)
+{
+	struct device_node *np;
+	struct resource mmu;
+	void __iomem *base;
+	int ret;
+
+	np = of_parse_phandle(dev->of_node, "iommus", 0);
+	if (!np)
+		return devm_ioremap_resource(dev, res);
+	ret = of_address_to_resource(np, 0, &mmu);
+	of_node_put(np);
+	if (ret)
+		return ERR_PTR(ret);
+	if (!resource_contains(res, &mmu))
+		return devm_ioremap_resource(dev, res);
+
+	/*
+	 * The IOMMU occupies a hole within the NPU register window. Reserve
+	 * only the NPU portions, leaving the IOMMU driver its own registers.
+	 * Keep one mapping so that all existing NPU register offsets work.
+	 */
+	if ((res->start < mmu.start &&
+	     !devm_request_mem_region(dev, res->start, mmu.start - res->start,
+				      dev_name(dev))) ||
+	    (mmu.end < res->end &&
+	     !devm_request_mem_region(dev, mmu.end + 1, res->end - mmu.end,
+				      dev_name(dev)))) {
+		dev_err(dev, "cannot reserve NPU registers outside IOMMU %pR\n", &mmu);
+		return ERR_PTR(-EBUSY);
+	}
+
+	base = devm_ioremap(dev, res->start, resource_size(res));
+	if (!base)
+		return ERR_PTR(-ENOMEM);
+	return base;
+}
+
 static int rknpu_probe(struct platform_device *pdev)
 {
 	struct resource *res = NULL;
@@ -1397,10 +1436,16 @@ static int rknpu_probe(struct platform_device *pdev)
 			return -ENXIO;
 		}
 
-		rknpu_dev->base[i] = devm_ioremap_resource(dev, res);
-		if (PTR_ERR(rknpu_dev->base[i]) == -EBUSY) {
-			rknpu_dev->base[i] = devm_ioremap(dev, res->start,
-							  resource_size(res));
+		if (of_device_is_compatible(dev->of_node, "rockchip,rv1126b-rknpu")) {
+			rknpu_dev->base[i] = rv1126b_rknpu_ioremap(dev, res);
+		} else {
+			rknpu_dev->base[i] = devm_ioremap_resource(dev, res);
+			if (PTR_ERR(rknpu_dev->base[i]) == -EBUSY) {
+				rknpu_dev->base[i] = devm_ioremap(dev, res->start,
+							      resource_size(res));
+				if (!rknpu_dev->base[i])
+					return -ENOMEM;
+			}
 		}
 
 		if (IS_ERR(rknpu_dev->base[i])) {
