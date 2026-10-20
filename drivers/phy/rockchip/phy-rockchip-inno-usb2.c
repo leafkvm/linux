@@ -2495,7 +2495,10 @@ static int rockchip_usb2phy_probe(struct platform_device *pdev)
 	rphy->chg_state = USB_CHG_STATE_UNDEFINED;
 	rphy->chg_type = POWER_SUPPLY_TYPE_UNKNOWN;
 	rphy->edev_self = false;
-	rphy->irq = platform_get_irq(pdev, 0);
+	/* Some SoCs provide separate interrupts on each port instead. */
+	rphy->irq = platform_get_irq_optional(pdev, 0);
+	if (rphy->irq < 0 && rphy->irq != -ENXIO)
+		return dev_err_probe(dev, rphy->irq, "failed to get combined IRQ\n");
 	platform_set_drvdata(pdev, rphy);
 
 	ret = rockchip_usb2phy_extcon_register(rphy);
