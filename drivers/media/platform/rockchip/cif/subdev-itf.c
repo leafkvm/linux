@@ -1773,7 +1773,7 @@ static int sditf_notifier_bound(struct v4l2_async_notifier *notifier,
 	sditf->sensor_sd = subdev;
 	++sditf->num_sensors;
 
-	v4l2_err(subdev, "Async registered subdev\n");
+	v4l2_dbg(1, rkcif_debug, subdev, "Async registered subdev\n");
 
 	return 0;
 }

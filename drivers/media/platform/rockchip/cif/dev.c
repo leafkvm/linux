@@ -2226,7 +2226,7 @@ static int subdev_notifier_bound(struct v4l2_async_notifier *notifier,
 	cif_dev->sensors[cif_dev->num_sensors].sd = subdev;
 	++cif_dev->num_sensors;
 
-	v4l2_err(subdev, "Async registered subdev\n");
+	v4l2_dbg(1, rkcif_debug, subdev, "Async registered subdev\n");
 
 	return 0;
 }
@@ -3145,7 +3145,7 @@ static void rkcif_parse_dts(struct rkcif_device *cif_dev)
 		cif_dev->is_detect_group_sync = false;
 	else
 		cif_dev->is_detect_group_sync = true;
-	dev_err(cif_dev->dev, "rkcif is_detect_group_sync %d\n", cif_dev->is_detect_group_sync);
+	dev_dbg(cif_dev->dev, "rkcif is_detect_group_sync %d\n", cif_dev->is_detect_group_sync);
 }
 
 static int rkcif_get_reserved_mem(struct rkcif_device *cif_dev)

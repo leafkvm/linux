@@ -338,7 +338,7 @@ static int csi2_s_stream(struct v4l2_subdev *sd, int enable)
 
 	mutex_lock(&csi2->lock);
 
-	dev_err(csi2->dev, "stream %s, src_sd: %p, sd_name:%s\n",
+	dev_dbg(csi2->dev, "stream %s, src_sd: %p, sd_name:%s\n",
 		enable ? "on" : "off",
 		csi2->src_sd, csi2->src_sd->name);
 
@@ -349,7 +349,7 @@ static int csi2_s_stream(struct v4l2_subdev *sd, int enable)
 	if (csi2->stream_count != !enable)
 		goto update_count;
 
-	dev_err(csi2->dev, "stream %s\n", enable ? "ON" : "OFF");
+	dev_dbg(csi2->dev, "stream %s\n", enable ? "ON" : "OFF");
 
 	if (enable)
 		ret = csi2_start(csi2);
