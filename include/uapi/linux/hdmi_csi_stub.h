@@ -9,7 +9,7 @@
  *
  * Communication runs over /dev/hdmi-csi-stub (a misc device):
  *
- *   daemon -> kernel   ioctls to report detected timings & audio status
+ *   daemon -> kernel   ioctls to report CSI video state & audio status
  *   kernel -> daemon   events delivered via read()/poll()
  *   daemon <- kernel   ioctls to retrieve EDID, configuration and status
  */
@@ -26,6 +26,9 @@
 #define HDMI_CSI_EDID_MAX_BLOCKS	8
 #define HDMI_CSI_EDID_MAX_SIZE		(HDMI_CSI_EDID_MAX_BLOCKS * \
 					 HDMI_CSI_EDID_BLOCK_SIZE)
+
+#define HDMI_CSI_ABI_VERSION		2
+#define HDMI_CSI_MAX_MBUS_CODES		8
 
 /* ------------------------------------------------------------------ */
 /* Structures                                                         */
@@ -74,6 +77,50 @@ struct hdmi_csi_timings {
 	__u8  reserved[10];	/* zero-filled; reserved for future expansion */
 };
 
+/* Sample semantics are independent of the CSI carrier. In particular, native
+ * YUV444 uses RGB888 CSI packets (DT 0x24) with U,Y,V bytes on this bridge.
+ */
+#define HDMI_CSI_PAYLOAD_NONE		0
+#define HDMI_CSI_PAYLOAD_RGB		1
+#define HDMI_CSI_PAYLOAD_YUV444		2
+#define HDMI_CSI_PAYLOAD_YUV422		3
+#define HDMI_CSI_PAYLOAD_YUV420		4
+
+/**
+ * struct hdmi_csi_video - Complete CSI output state, owned by the daemon.
+ *
+ * REPORT_VIDEO commits format, timings and colour signalling atomically, then
+ * notifies V4L2 consumers if any of them changed. Use standard MEDIA_BUS_FMT_*
+ * codes for the carrier, not capture-memory fourccs. The code must appear in
+ * GET_CAPS. payload_encoding describes the samples inside that carrier; RGB888
+ * can carry RGB or unconverted YUV444. Capture clients must use GET_VIDEO on the
+ * V4L2 subdevice and honor payload_encoding before interpreting/encoding frames.
+ *
+ * For no signal, send an entirely zero-filled structure. No active format is
+ * published until the daemon reports a valid signal. All reserved bytes,
+ * including timings.reserved, must be zero. Invalid reports leave state intact.
+ */
+struct hdmi_csi_video {
+	struct hdmi_csi_timings timings;
+	__u32 mbus_fmt_code;
+	__u32 payload_encoding;	/* HDMI_CSI_PAYLOAD_* */
+	__u32 reserved[2];
+};
+
+/**
+ * struct hdmi_csi_caps - Misc-device protocol and supported CSI wire formats.
+ *
+ * Query after opening the misc device, before reporting video. Formats describe
+ * stub support; capture clients must also configure a compatible CSI pipeline.
+ * The capability list is fixed for the lifetime of the open daemon connection.
+ */
+struct hdmi_csi_caps {
+	__u32 abi_version;
+	__u32 num_mbus_codes;
+	__u32 mbus_codes[HDMI_CSI_MAX_MBUS_CODES];
+	__u32 reserved[6];
+};
+
 /**
  * struct hdmi_csi_audio_info - Audio status reported by the daemon.
  */
@@ -116,9 +163,9 @@ struct hdmi_csi_stream_status {
 /* IOCTLs                                                             */
 /* ------------------------------------------------------------------ */
 
-/* Daemon -> kernel: push detected timings (or no-signal) */
-#define HDMI_CSI_IOC_REPORT_TIMINGS \
-	_IOW(HDMI_CSI_STUB_IOC_MAGIC, 0, struct hdmi_csi_timings)
+/* Daemon -> kernel: atomically publish CSI format, timings and colour. */
+#define HDMI_CSI_IOC_REPORT_VIDEO \
+	_IOW(HDMI_CSI_STUB_IOC_MAGIC, 0, struct hdmi_csi_video)
 
 /* Daemon -> kernel: push audio status */
 #define HDMI_CSI_IOC_REPORT_AUDIO \
@@ -136,12 +183,21 @@ struct hdmi_csi_stream_status {
 #define HDMI_CSI_IOC_GET_STREAM_STATUS \
 	_IOR(HDMI_CSI_STUB_IOC_MAGIC, 4, struct hdmi_csi_stream_status)
 
+/* Daemon <- kernel: query protocol and supported CSI wire formats. */
+#define HDMI_CSI_IOC_GET_CAPS \
+	_IOR(HDMI_CSI_STUB_IOC_MAGIC, 5, struct hdmi_csi_caps)
+
+/* Read the same complete snapshot on the misc device or V4L2 subdevice.
+ * Consumers use the subdevice, leaving the exclusive misc owner to the daemon.
+ */
+#define HDMI_CSI_IOC_GET_VIDEO \
+	_IOR(HDMI_CSI_STUB_IOC_MAGIC, 6, struct hdmi_csi_video)
+
 /* ------------------------------------------------------------------ */
 /* Events (delivered to daemon via read() on the misc device fd)      */
 /* ------------------------------------------------------------------ */
 
 #define HDMI_CSI_EVT_EDID_UPDATE	1  /* V4L2 set_edid was called */
-#define HDMI_CSI_EVT_FMT_CHANGE	2  /* V4L2 set_fmt was called  */
 #define HDMI_CSI_EVT_STREAM_CHANGE	3  /* value: 0 = off, 1 = on   */
 
 /**

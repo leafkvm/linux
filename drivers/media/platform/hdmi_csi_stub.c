@@ -16,10 +16,8 @@
  *     directly.  The V4L2_CID_DV_RX_POWER_PRESENT control is omitted.
  *   - No enum_frame_size / enum_frame_interval: the active mode always
  *     tracks the detected input signal.
- *   - set_fmt only changes the output colour format (mbus code); the
- *     resolution always equals the input signal.
- *   - Timings are read-only from the V4L2 side.  s_dv_timings is accepted
- *     but only used internally when the daemon reports new timings.
+ *   - The daemon owns CSI format, timings and colour signalling. V4L2
+ *     set_fmt / s_dv_timings only accept the already-published state.
  */
 
 #include <linux/kernel.h>
@@ -60,6 +58,22 @@ MODULE_LICENSE("GPL");
 
 /* Maximum number of queued events for the daemon */
 #define EVENT_QUEUE_SIZE	16
+
+static const u32 hdmi_csi_mbus_codes[] = {
+	MEDIA_BUS_FMT_UYVY8_2X8,
+	MEDIA_BUS_FMT_RGB888_1X24,
+	MEDIA_BUS_FMT_UV8_1X8, /* legacy YUV420, CSI DT 0x1a */
+};
+
+static bool supported_mbus_code(u32 code)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(hdmi_csi_mbus_codes); i++)
+		if (code == hdmi_csi_mbus_codes[i])
+			return true;
+	return false;
+}
 
 static const struct v4l2_dv_timings_cap hdmi_csi_timings_cap = {
 	.type = V4L2_DV_BT_656_1120,
@@ -138,6 +152,8 @@ struct hdmi_csi_stub_state {
 	/* Configuration from DT */
 	u8				csi_lanes;
 	struct v4l2_mbus_config_mipi_csi2 bus;
+
+	struct hdmi_csi_video		video; /* complete carrier/payload state */
 
 	/* Current V4L2 state */
 	struct v4l2_dv_timings		timings;	/* active timings */
@@ -309,11 +325,21 @@ static int stub_subscribe_event(struct v4l2_subdev *sd, struct v4l2_fh *fh,
 	}
 }
 
+static void get_video(struct hdmi_csi_stub_state *st, struct hdmi_csi_video *video)
+{
+	mutex_lock(&st->lock);
+	*video = st->video;
+	mutex_unlock(&st->lock);
+}
+
 static long stub_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)
 {
 	struct hdmi_csi_stub_state *st = sd_to_state(sd);
 
 	switch (cmd) {
+	case HDMI_CSI_IOC_GET_VIDEO:
+		get_video(st, arg);
+		return 0;
 	case RKMODULE_GET_HDMI_MODE:
 		*(int *)arg = RKMODULE_HDMIIN_MODE;
 		return 0;
@@ -332,10 +358,14 @@ static long stub_compat_ioctl32(struct v4l2_subdev *sd,
 				unsigned int cmd, unsigned long arg)
 {
 	void __user *up = compat_ptr(arg);
+	struct hdmi_csi_video video;
 	int *seq;
 	long ret;
 
 	switch (cmd) {
+	case HDMI_CSI_IOC_GET_VIDEO:
+		get_video(sd_to_state(sd), &video);
+		return copy_to_user(up, &video, sizeof(video)) ? -EFAULT : 0;
 	case RKMODULE_GET_HDMI_MODE:
 	case RK_HDMIRX_CMD_GET_SIGNAL_STABLE_STATUS:
 		seq = kzalloc(sizeof(*seq), GFP_KERNEL);
@@ -380,27 +410,24 @@ static int stub_g_input_status(struct v4l2_subdev *sd, u32 *status)
 	return 0;
 }
 
-/*
- * s_dv_timings - accepted for compatibility but timings always track the
- * input signal.  Userspace callers get success but the value is overwritten
- * the next time the daemon reports new timings.
- */
+/* Capture clients may confirm the source timings but cannot change them. */
 static int stub_s_dv_timings(struct v4l2_subdev *sd,
 			     struct v4l2_dv_timings *timings)
 {
 	struct hdmi_csi_stub_state *st = sd_to_state(sd);
+	int ret;
 
 	if (!timings)
 		return -EINVAL;
 
-	if (!v4l2_valid_dv_timings(timings, &hdmi_csi_timings_cap, NULL, NULL))
-		return -ERANGE;
-
 	mutex_lock(&st->lock);
-	st->timings = *timings;
+	if (!st->signal_present)
+		ret = -ENOLINK;
+	else
+		ret = v4l2_match_dv_timings(&st->timings, timings, 0, false)
+			? 0 : -EINVAL;
 	mutex_unlock(&st->lock);
-
-	return 0;
+	return ret;
 }
 
 static int stub_g_dv_timings(struct v4l2_subdev *sd,
@@ -490,16 +517,9 @@ static int stub_enum_mbus_code(struct v4l2_subdev *sd,
 			       struct v4l2_subdev_state *sd_state,
 			       struct v4l2_subdev_mbus_code_enum *code)
 {
-	switch (code->index) {
-	case 0:
-		code->code = MEDIA_BUS_FMT_UYVY8_2X8;
-		break;
-	case 1:
-		code->code = MEDIA_BUS_FMT_RGB888_1X24;
-		break;
-	default:
+	if (code->pad || code->index >= ARRAY_SIZE(hdmi_csi_mbus_codes))
 		return -EINVAL;
-	}
+	code->code = hdmi_csi_mbus_codes[code->index];
 	return 0;
 }
 
@@ -516,24 +536,18 @@ static int stub_get_fmt(struct v4l2_subdev *sd,
 {
 	struct hdmi_csi_stub_state *st = sd_to_state(sd);
 
+	if (format->pad || (format->which != V4L2_SUBDEV_FORMAT_ACTIVE &&
+			    format->which != V4L2_SUBDEV_FORMAT_TRY))
+		return -EINVAL;
+
 	mutex_lock(&st->lock);
 	format->format.code = st->mbus_fmt_code;
 	format->format.width = st->timings.bt.width;
 	format->format.height = st->timings.bt.height;
 	format->format.field = (st->timings.bt.interlaced)
 		? V4L2_FIELD_INTERLACED : V4L2_FIELD_NONE;
-	/*
-	 * Colorimetry: honour what the daemon reported; fall back to the
-	 * format-code heuristic when it is unknown (DEFAULT).  ycbcr_enc and
-	 * xfer_func stay DEFAULT so they are derived from the colorspace by the
-	 * standard V4L2 mapping.
-	 */
-	if (st->colorspace != V4L2_COLORSPACE_DEFAULT)
-		format->format.colorspace = st->colorspace;
-	else
-		format->format.colorspace =
-			(st->mbus_fmt_code == MEDIA_BUS_FMT_RGB888_1X24)
-			? V4L2_COLORSPACE_SRGB : V4L2_COLORSPACE_SMPTE170M;
+	/* Re-export daemon signalling verbatim, including DEFAULT/unknown. */
+	format->format.colorspace = st->colorspace;
 	format->format.ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
 	format->format.xfer_func = V4L2_XFER_FUNC_DEFAULT;
 	format->format.quantization = st->quantization;
@@ -543,50 +557,27 @@ static int stub_get_fmt(struct v4l2_subdev *sd,
 }
 
 /*
- * set_fmt: only the media-bus format code is honoured.  The resolution
- * always follows the input signal (daemon-reported timings).
- *
- * tc35874x's set_fmt picks from a fixed supported_modes table and
- * reconfigures PLL/CSI.  We only store the new colour format and notify the
- * daemon which will reconfigure the bridge chip's colour-space conversion.
+ * The source pad describes what the daemon actually transmits. TRY returns
+ * that format; ACTIVE accepts a matching code without mutating source state.
+ * Capture-memory layout is negotiated separately at the capture device.
  */
 static int stub_set_fmt(struct v4l2_subdev *sd,
 			struct v4l2_subdev_state *sd_state,
 			struct v4l2_subdev_format *format)
 {
-	struct hdmi_csi_stub_state *st = sd_to_state(sd);
 	u32 code = format->format.code;
 	int ret;
 
-	/* Populate current values first (resolution, field, etc.) */
+	if (!supported_mbus_code(code))
+		return -EINVAL;
+
 	ret = stub_get_fmt(sd, sd_state, format);
 	if (ret)
 		return ret;
 
-	/* Validate requested mbus code */
-	switch (code) {
-	case MEDIA_BUS_FMT_RGB888_1X24:
-	case MEDIA_BUS_FMT_UYVY8_2X8:
-		break;
-	default:
+	if (format->which == V4L2_SUBDEV_FORMAT_ACTIVE &&
+	    code != format->format.code)
 		return -EINVAL;
-	}
-
-	/* Restore the requested code in the returned format */
-	format->format.code = code;
-	format->format.colorspace =
-		(code == MEDIA_BUS_FMT_RGB888_1X24)
-		? V4L2_COLORSPACE_SRGB : V4L2_COLORSPACE_SMPTE170M;
-
-	if (format->which == V4L2_SUBDEV_FORMAT_TRY)
-		return 0;
-
-	mutex_lock(&st->lock);
-	if (st->mbus_fmt_code != code) {
-		st->mbus_fmt_code = code;
-		push_daemon_event(st, HDMI_CSI_EVT_FMT_CHANGE, 0);
-	}
-	mutex_unlock(&st->lock);
 
 	return 0;
 }
@@ -799,6 +790,9 @@ static int misc_release(struct inode *inode, struct file *filp)
 	/* If daemon goes away, report signal lost */
 	if (st->signal_present) {
 		st->signal_present = false;
+		memset(&st->video, 0, sizeof(st->video));
+		st->mbus_fmt_code = 0;
+		st->link_freq_items[0] = 0;
 		memset(&st->timings, 0, sizeof(st->timings));
 		st->quantization = V4L2_QUANTIZATION_DEFAULT;
 		st->colorspace = V4L2_COLORSPACE_DEFAULT;
@@ -862,57 +856,111 @@ static __poll_t misc_poll(struct file *filp, struct poll_table_struct *wait)
 	return mask;
 }
 
-static long misc_ioctl_report_timings(struct hdmi_csi_stub_state *st,
-				      void __user *arg)
+/* Commit a source snapshot under one lock and notify after every field is set. */
+static long publish_video(struct hdmi_csi_stub_state *st,
+			 const struct hdmi_csi_video *video)
 {
-	struct hdmi_csi_timings ut;
+	const struct hdmi_csi_timings *ut = &video->timings;
+	u32 mbus_code = video->mbus_fmt_code;
 	struct v4l2_dv_timings new_timings;
-	bool valid, changed;
-
-	if (copy_from_user(&ut, arg, sizeof(ut)))
-		return -EFAULT;
-
-	valid = timings_to_v4l2(&ut, &new_timings);
-
-	/* Clamp out-of-range colour values rather than rejecting the whole
-	 * timings report; an unknown value simply degrades to DEFAULT.
-	 */
-	if (ut.quantization > V4L2_QUANTIZATION_LIM_RANGE)
-		ut.quantization = V4L2_QUANTIZATION_DEFAULT;
-	if (ut.colorspace >= V4L2_COLORSPACE_LAST)
-		ut.colorspace = V4L2_COLORSPACE_DEFAULT;
+	bool valid = timings_to_v4l2(ut, &new_timings);
+	bool changed;
 
 	mutex_lock(&st->lock);
-	changed = !v4l2_match_dv_timings(&st->timings, &new_timings, 0, false)
-		  || st->signal_present != valid;
+	changed = st->signal_present != valid ||
+		  (valid && !v4l2_match_dv_timings(&st->timings, &new_timings,
+						 0, false));
+	if (st->mbus_fmt_code != mbus_code) {
+		st->mbus_fmt_code = mbus_code;
+		changed = true;
+	}
+
+	if (st->video.payload_encoding != video->payload_encoding)
+		changed = true;
+	st->video = *video;
 
 	st->signal_present = valid;
 	if (valid) {
 		st->timings = new_timings;
-		/* Colour signalling rides with the timings. A colour-only
-		 * change (same timings) must still prompt consumers to
-		 * re-read, so fold it into the change detection.
-		 */
-		if (st->quantization != ut.quantization ||
-		    st->colorspace != ut.colorspace)
+		if (st->quantization != ut->quantization ||
+		    st->colorspace != ut->colorspace)
 			changed = true;
-		st->quantization = ut.quantization;
-		st->colorspace = ut.colorspace;
+		st->quantization = ut->quantization;
+		st->colorspace = ut->colorspace;
 	} else {
 		memset(&st->timings, 0, sizeof(st->timings));
-		/* Colour signalling is meaningless without a signal. */
 		st->quantization = V4L2_QUANTIZATION_DEFAULT;
 		st->colorspace = V4L2_COLORSPACE_DEFAULT;
 	}
 
-	/* Update link-freq menu item: byte_clock_kHz * 4 * 1000 -> Hz */
-	st->link_freq_items[0] = (s64)ut.mipi_byte_clock * 4000;
+	/* byte_clock_kHz * 4 * 1000 -> link frequency in Hz */
+	if (st->link_freq_items[0] != (s64)ut->mipi_byte_clock * 4000)
+		changed = true;
+	st->link_freq_items[0] = (s64)ut->mipi_byte_clock * 4000;
 
 	if (changed)
 		fire_source_change(st);
 	mutex_unlock(&st->lock);
-
 	return 0;
+}
+
+static bool valid_payload(const struct hdmi_csi_video *video)
+{
+	switch (video->payload_encoding) {
+	case HDMI_CSI_PAYLOAD_RGB:
+	case HDMI_CSI_PAYLOAD_YUV444:
+		return video->mbus_fmt_code == MEDIA_BUS_FMT_RGB888_1X24;
+	case HDMI_CSI_PAYLOAD_YUV422:
+		return video->mbus_fmt_code == MEDIA_BUS_FMT_UYVY8_2X8;
+	case HDMI_CSI_PAYLOAD_YUV420:
+		return video->mbus_fmt_code == MEDIA_BUS_FMT_UV8_1X8;
+	default:
+		return false;
+	}
+}
+
+static long misc_ioctl_report_video(struct hdmi_csi_stub_state *st,
+				    void __user *arg)
+{
+	struct hdmi_csi_video video;
+	struct v4l2_dv_timings timings;
+	const struct hdmi_csi_timings *t = &video.timings;
+
+	if (copy_from_user(&video, arg, sizeof(video)))
+		return -EFAULT;
+
+	if (!t->h_active || !t->v_active) {
+		if (memchr_inv(&video, 0, sizeof(video)))
+			return -EINVAL;
+	} else {
+		if (!supported_mbus_code(video.mbus_fmt_code) ||
+		    !valid_payload(&video) ||
+		    memchr_inv(video.reserved, 0, sizeof(video.reserved)) ||
+		    memchr_inv(t->reserved, 0, sizeof(t->reserved)) ||
+		    t->quantization > V4L2_QUANTIZATION_LIM_RANGE ||
+		    t->colorspace >= V4L2_COLORSPACE_LAST ||
+		    t->h_sync_pol > 1 || t->v_sync_pol > 1 || t->interlaced > 1)
+			return -EINVAL;
+		timings_to_v4l2(t, &timings);
+		if (!t->pixel_clock ||
+		    !v4l2_valid_dv_timings(&timings, &hdmi_csi_timings_cap,
+					 NULL, NULL))
+			return -ERANGE;
+	}
+
+	return publish_video(st, &video);
+}
+
+static long misc_ioctl_get_caps(void __user *arg)
+{
+	struct hdmi_csi_caps caps = {
+		.abi_version = HDMI_CSI_ABI_VERSION,
+		.num_mbus_codes = ARRAY_SIZE(hdmi_csi_mbus_codes),
+	};
+
+	BUILD_BUG_ON(ARRAY_SIZE(hdmi_csi_mbus_codes) > HDMI_CSI_MAX_MBUS_CODES);
+	memcpy(caps.mbus_codes, hdmi_csi_mbus_codes, sizeof(hdmi_csi_mbus_codes));
+	return copy_to_user(arg, &caps, sizeof(caps)) ? -EFAULT : 0;
 }
 
 static long misc_ioctl_report_audio(struct hdmi_csi_stub_state *st,
@@ -1001,8 +1049,16 @@ static long misc_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	void __user *uarg = (void __user *)arg;
 
 	switch (cmd) {
-	case HDMI_CSI_IOC_REPORT_TIMINGS:
-		return misc_ioctl_report_timings(st, uarg);
+	case HDMI_CSI_IOC_GET_VIDEO: {
+		struct hdmi_csi_video video;
+
+		get_video(st, &video);
+		return copy_to_user(uarg, &video, sizeof(video)) ? -EFAULT : 0;
+	}
+	case HDMI_CSI_IOC_GET_CAPS:
+		return misc_ioctl_get_caps(uarg);
+	case HDMI_CSI_IOC_REPORT_VIDEO:
+		return misc_ioctl_report_video(st, uarg);
 	case HDMI_CSI_IOC_REPORT_AUDIO:
 		return misc_ioctl_report_audio(st, uarg);
 	case HDMI_CSI_IOC_GET_CONFIG:
@@ -1139,8 +1195,8 @@ static int stub_probe(struct platform_device *pdev)
 	if (err < 0)
 		goto err_hdl;
 
-	/* Default state: no signal, UYVY output, no EDID, unknown colour */
-	st->mbus_fmt_code = MEDIA_BUS_FMT_UYVY8_2X8;
+	/* No format is active until the daemon publishes a complete snapshot. */
+	st->mbus_fmt_code = 0;
 	st->quantization = V4L2_QUANTIZATION_DEFAULT;
 	st->colorspace = V4L2_COLORSPACE_DEFAULT;
 	st->signal_present = false;
