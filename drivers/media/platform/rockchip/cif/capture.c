@@ -27,6 +27,7 @@
 #include <clocksource/arm_arch_timer.h>
 #include <linux/kfifo.h>
 #include <linux/gpio/consumer.h>
+#include <linux/hdmi_csi_stub.h>
 
 #include "dev.h"
 #include "mipi-csi2.h"
@@ -159,6 +160,14 @@ static const struct cif_output_fmt out_fmts[] = {
 		.fmt_type = CIF_FMT_TYPE_RAW,
 	}, {
 		.fourcc = V4L2_PIX_FMT_BGR24,
+		.cplanes = 1,
+		.mplanes = 1,
+		.bpp = { 24 },
+		.csi_fmt_val = CSI_WRDDR_TYPE_RGB888,
+		.fmt_type = CIF_FMT_TYPE_RAW,
+	}, {
+		/* Native YUV444 in RGB888 CSI packets, reordered while writing. */
+		.fourcc = V4L2_PIX_FMT_YUV24,
 		.cplanes = 1,
 		.mplanes = 1,
 		.bpp = { 24 },
@@ -663,6 +672,18 @@ static inline int rkcif_get_interlace_mode(struct rkcif_stream *stream)
 	return RKCIF_INTERLACE_NONE;
 }
 
+static void rkcif_copy_source_color(struct rkcif_stream *stream,
+				  struct v4l2_pix_format_mplane *pixm)
+{
+	const struct v4l2_mbus_framefmt *source =
+		&stream->cifdev->channels[stream->id].source_fmt;
+
+	pixm->colorspace = source->colorspace;
+	pixm->quantization = source->quantization;
+	pixm->ycbcr_enc = source->ycbcr_enc;
+	pixm->xfer_func = source->xfer_func;
+}
+
 static int rkcif_output_fmt_check(struct rkcif_stream *stream,
 				  const struct cif_output_fmt *output_fmt)
 {
@@ -671,6 +692,18 @@ static int rkcif_output_fmt_check(struct rkcif_stream *stream,
 	int ret = -EINVAL;
 
 	stream->rounding_bit = 0;
+	if (!input_fmt)
+		return -EINVAL;
+
+	/* The carrier alone cannot distinguish RGB from native YUV444. */
+	if (channel->payload_encoding == HDMI_CSI_PAYLOAD_YUV444) {
+		if (stream->cifdev->chip_id == CHIP_RV1126B_CIF &&
+		    stream->cifdev->terminal_sensor.mbus.type == V4L2_MBUS_CSI2_DPHY &&
+		    input_fmt->mbus_code == MEDIA_BUS_FMT_RGB888_1X24 &&
+		    output_fmt->fourcc == V4L2_PIX_FMT_YUV24)
+			return 0;
+		return -EINVAL;
+	}
 	switch (input_fmt->mbus_code) {
 	case MEDIA_BUS_FMT_YUYV8_2X8:
 	case MEDIA_BUS_FMT_YVYU8_2X8:
@@ -1042,12 +1075,21 @@ const struct
 cif_input_fmt *rkcif_get_input_fmt(struct rkcif_device *dev, struct v4l2_rect *rect,
 			     u32 pad_id, struct csi_channel_info *csi_info)
 {
-	struct v4l2_subdev_format fmt;
+	struct v4l2_subdev_format fmt = {0};
+	struct hdmi_csi_video video;
 	struct v4l2_subdev *sd = dev->terminal_sensor.sd;
 	struct rkmodule_channel_info ch_info = {0};
 	struct rkmodule_capture_info capture_info;
 	int ret;
 	u32 i;
+
+	/* Optional sensor overrides must not cache a previous capture's derived
+	 * CSI packet type. The source can switch RGB/YUV between sessions.
+	 */
+	csi_info->data_type = 0;
+	csi_info->data_bit = 0;
+	csi_info->payload_encoding = HDMI_CSI_PAYLOAD_NONE;
+	memset(&csi_info->source_fmt, 0, sizeof(csi_info->source_fmt));
 
 	fmt.pad = 0;
 	fmt.which = V4L2_SUBDEV_FORMAT_ACTIVE;
@@ -1058,6 +1100,20 @@ cif_input_fmt *rkcif_get_input_fmt(struct rkcif_device *dev, struct v4l2_rect *r
 		v4l2_warn(sd->v4l2_dev,
 			  "sensor fmt invalid, set to default size\n");
 		goto set_default;
+	}
+	ret = v4l2_subdev_call(sd, core, ioctl, HDMI_CSI_IOC_GET_VIDEO, &video);
+	if (!ret) {
+		/* Use one atomic snapshot for the carrier, payload and metadata. */
+		fmt.format.code = video.mbus_fmt_code;
+		fmt.format.width = video.timings.h_active;
+		fmt.format.height = video.timings.v_active;
+		fmt.format.field = video.timings.interlaced ?
+			V4L2_FIELD_INTERLACED : V4L2_FIELD_NONE;
+		fmt.format.colorspace = video.timings.colorspace;
+		fmt.format.quantization = video.timings.quantization;
+		fmt.format.ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
+		fmt.format.xfer_func = V4L2_XFER_FUNC_DEFAULT;
+		csi_info->payload_encoding = video.payload_encoding;
 	}
 	ch_info.index = pad_id;
 	ret = v4l2_subdev_call(sd,
@@ -1083,6 +1139,7 @@ cif_input_fmt *rkcif_get_input_fmt(struct rkcif_device *dev, struct v4l2_rect *r
 	} else {
 		csi_info->vc = pad_id;
 	}
+	csi_info->source_fmt = fmt.format;
 
 	v4l2_dbg(1, rkcif_debug, sd->v4l2_dev,
 		 "remote fmt: mbus code:0x%x, size:%dx%d, field: %d\n",
@@ -4572,6 +4629,11 @@ static int rkcif_csi_get_output_type_mask_rk3576(struct rkcif_stream *stream)
 	const struct cif_output_fmt *fmt = stream->cif_fmt_out;
 
 	switch (fmt->fourcc) {
+	case V4L2_PIX_FMT_YUV24:
+		/* Native carrier bytes U,Y,V become standard packed Y,U,V. */
+		mask = (CSI_WRDDR_TYPE_RAW_COMPACT << 3) |
+		       CSI_RGB_SWAP_FIRST_SECOND_RV1126B;
+		break;
 	case V4L2_PIX_FMT_NV16:
 		mask = CSI_WRDDR_TYPE_YUV422SP_RK3588 << 3 | CSI_YUV_OUTPUT_ORDER_UYVY >> 4;
 		break;
@@ -4597,6 +4659,11 @@ static int rkcif_csi_get_output_type_mask_rk3576(struct rkcif_stream *stream)
 		mask = CSI_WRDDR_TYPE_YUV_PACKET << 3 | CSI_YUV_OUTPUT_ORDER_VYUY >> 4;
 		break;
 	case V4L2_PIX_FMT_RGB24:
+		/* RV1126B writes B,G,R natively; RGB24 requires R,G,B bytes. */
+		mask = CSI_WRDDR_TYPE_RAW_COMPACT << 3;
+		if (stream->cifdev->chip_id == CHIP_RV1126B_CIF)
+			mask |= CSI_RGB_SWAP_FIRST_THIRD_RV1126B;
+		break;
 	case V4L2_PIX_FMT_BGR24:
 	case V4L2_PIX_FMT_RGB565:
 	case V4L2_PIX_FMT_BGR666:
@@ -7468,6 +7535,7 @@ static u32 rkcif_align_bits_per_pixel(struct rkcif_stream *stream,
 			break;
 		case V4L2_PIX_FMT_RGB24:
 		case V4L2_PIX_FMT_BGR24:
+		case V4L2_PIX_FMT_YUV24:
 		case V4L2_PIX_FMT_RGB565:
 		case V4L2_PIX_FMT_BGR666:
 		case V4L2_PIX_FMT_SRGGB8:
@@ -8747,6 +8815,13 @@ int rkcif_do_start_stream(struct rkcif_stream *stream, enum rkcif_stream_mode mo
 	ret = rkcif_sanity_check_fmt(stream, NULL);
 	if (ret < 0)
 		goto destroy_buf;
+	/* The payload can change while retaining the same RGB888 CSI carrier.
+	 * Revalidate at STREAMON, after refreshing the source snapshot.
+	 */
+	ret = rkcif_output_fmt_check(stream, stream->cif_fmt_out);
+	if (ret < 0)
+		goto destroy_buf;
+	rkcif_copy_source_color(stream, &stream->pixm);
 
 	if (atomic_read(&dev->pipe.stream_cnt) == 0 &&
 	    dev->active_sensor &&
@@ -9109,7 +9184,7 @@ int rkcif_set_fmt(struct rkcif_stream *stream,
 			       CIF_MIN_HEIGHT, input_rect.height);
 	pixm->num_planes = fmt->mplanes;
 	pixm->field = V4L2_FIELD_NONE;
-	pixm->quantization = V4L2_QUANTIZATION_DEFAULT;
+	rkcif_copy_source_color(stream, pixm);
 
 	rkcif_sync_crop_info(stream);
 	/* calculate plane size and image size */

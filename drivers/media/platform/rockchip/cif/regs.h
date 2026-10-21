@@ -1073,6 +1073,9 @@ enum cif_reg_index {
 #define CSI_YUV_OUTPUT_ORDER_VYUY	(0x1 << 18)
 #define CSI_YUV_OUTPUT_ORDER_YUYV	(0x2 << 18)
 #define CSI_YUV_OUTPUT_ORDER_YVYU	(0x3 << 18)
+/* RGB888 parser output byte order on RV1126B (CTRL0[15:14]). */
+#define CSI_RGB_SWAP_FIRST_SECOND_RV1126B	(0x1 << 14)
+#define CSI_RGB_SWAP_FIRST_THIRD_RV1126B	(0x3 << 14)
 #define CSI_WRDDR_TYPE_RAW_COMPACT	(0x0 << 5)
 #define CSI_WRDDR_TYPE_RAW_UNCOMPACT	(0x1 << 5)
 #define CSI_WRDDR_TYPE_YUV_PACKET	(0x2 << 5)

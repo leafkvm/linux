@@ -304,6 +304,8 @@ struct cif_input_fmt {
 };
 
 struct csi_channel_info {
+	struct v4l2_mbus_framefmt source_fmt;
+	u32 payload_encoding;
 	unsigned char id;
 	unsigned char enable;	/* capture enable */
 	unsigned char vc;
