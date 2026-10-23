@@ -1929,6 +1929,10 @@ static irqreturn_t rockchip_sai_isr(int irq, void *devid)
 		regmap_update_bits(sai->regmap, SAI_INTCR,
 				   SAI_INTCR_RXFLE_MASK,
 				   SAI_INTCR_RXFLE(0));
+		/* As slave, no data in time usually means BCLK/LRCK are gone */
+		substream = sai->substreams[SNDRV_PCM_STREAM_CAPTURE];
+		if (substream)
+			snd_pcm_stop_xrun(substream);
 	}
 
 	return IRQ_HANDLED;
