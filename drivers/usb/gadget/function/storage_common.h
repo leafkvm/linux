@@ -170,6 +170,17 @@ struct fsg_lun {
 	const char	*name;		/* "lun.name" */
 	const char	**name_pfx;	/* "function.name" */
 	char		inquiry_string[INQUIRY_STRING_LEN];
+
+	/*
+	 * What the host did with the medium, for userspace (host_state).
+	 * Written by the worker thread, read locklessly by the attribute.
+	 */
+	bool		host_stopped;	/* START STOP UNIT with Start=0 */
+	bool		host_dirty;	/* writes since the host's last flush */
+	u32		host_ejects;	/* media ejected by the host (LoEj) */
+	u64		host_writes;	/* WRITE commands */
+	u64		host_flushes;	/* SYNCHRONIZE CACHE / unlock flushes */
+	ktime_t		host_last_write;
 };
 
 static inline bool fsg_lun_is_open(struct fsg_lun *curlun)
@@ -256,6 +267,7 @@ ssize_t fsg_show_nofua(struct fsg_lun *curlun, char *buf);
 ssize_t fsg_show_file(struct fsg_lun *curlun, struct rw_semaphore *filesem,
 		      char *buf);
 ssize_t fsg_show_inquiry_string(struct fsg_lun *curlun, char *buf);
+ssize_t fsg_show_host_state(struct fsg_lun *curlun, char *buf);
 ssize_t fsg_show_cdrom(struct fsg_lun *curlun, char *buf);
 ssize_t fsg_show_removable(struct fsg_lun *curlun, char *buf);
 ssize_t fsg_store_ro(struct fsg_lun *curlun, struct rw_semaphore *filesem,

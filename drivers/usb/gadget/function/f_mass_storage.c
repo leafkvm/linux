@@ -282,6 +282,9 @@ struct fsg_common {
 	struct completion	thread_notifier;
 	struct task_struct	*thread_task;
 
+	/* Flushes every backing file when the host goes away or sleeps. */
+	struct work_struct	sync_work;
+
 	/* Gadget's private data. */
 	void			*private_data;
 
@@ -786,6 +789,11 @@ static int do_write(struct fsg_common *common)
 		return -EINVAL;
 	}
 
+	WRITE_ONCE(curlun->host_writes, curlun->host_writes + 1);
+	WRITE_ONCE(curlun->host_last_write, ktime_get());
+	if (!(curlun->filp->f_flags & O_SYNC))
+		WRITE_ONCE(curlun->host_dirty, true);
+
 	/* Carry out the file writes */
 	get_some_more = 1;
 	file_offset = usb_offset = ((loff_t) lba) << curlun->blkbits;
@@ -930,8 +938,12 @@ static int do_synchronize_cache(struct fsg_common *common)
 	/* We ignore the requested LBA and write out all file's
 	 * dirty data buffers. */
 	rc = fsg_lun_fsync_sub(curlun);
-	if (rc)
+	if (rc) {
 		curlun->sense_data = SS_WRITE_ERROR;
+	} else {
+		WRITE_ONCE(curlun->host_flushes, curlun->host_flushes + 1);
+		WRITE_ONCE(curlun->host_dirty, false);
+	}
 	return 0;
 }
 
@@ -1454,6 +1466,7 @@ static int do_start_stop(struct fsg_common *common)
 			curlun->sense_data = SS_MEDIUM_NOT_PRESENT;
 			return -EINVAL;
 		}
+		WRITE_ONCE(curlun->host_stopped, false);
 		return 0;
 	}
 
@@ -1464,12 +1477,18 @@ static int do_start_stop(struct fsg_common *common)
 		return -EINVAL;
 	}
 
+	WRITE_ONCE(curlun->host_stopped, true);
 	if (!loej)
 		return 0;
 
 	up_read(&common->filesem);
 	down_write(&common->filesem);
-	fsg_lun_close(curlun);
+	/* Userspace takes "ejected by the host" to mean "safely on disk". */
+	if (fsg_lun_is_open(curlun)) {
+		fsg_lun_fsync_sub(curlun);
+		fsg_lun_close(curlun);
+		WRITE_ONCE(curlun->host_ejects, curlun->host_ejects + 1);
+	}
 	up_write(&common->filesem);
 	down_read(&common->filesem);
 
@@ -1494,8 +1513,11 @@ static int do_prevent_allow(struct fsg_common *common)
 		return -EINVAL;
 	}
 
-	if (curlun->prevent_medium_removal && !prevent)
-		fsg_lun_fsync_sub(curlun);
+	if (curlun->prevent_medium_removal && !prevent &&
+	    !fsg_lun_fsync_sub(curlun)) {
+		WRITE_ONCE(curlun->host_flushes, curlun->host_flushes + 1);
+		WRITE_ONCE(curlun->host_dirty, false);
+	}
 	curlun->prevent_medium_removal = prevent;
 	return 0;
 }
@@ -2785,6 +2807,29 @@ static void fsg_disable(struct usb_function *f)
 	}
 
 	__raise_exception(fsg->common, FSG_STATE_CONFIG_CHANGE, NULL);
+	/* Disconnect or reset: the host may never come back to flush. */
+	schedule_work(&fsg->common->sync_work);
+}
+
+static void fsg_suspend(struct usb_function *f)
+{
+	struct fsg_dev *fsg = fsg_from_func(f);
+
+	/* A sleeping host may lose power or be unplugged without a flush. */
+	schedule_work(&fsg->common->sync_work);
+}
+
+static void fsg_sync_work(struct work_struct *work)
+{
+	struct fsg_common *common =
+		container_of(work, struct fsg_common, sync_work);
+	int i;
+
+	down_read(&common->filesem);
+	for (i = 0; i < ARRAY_SIZE(common->luns); ++i)
+		if (common->luns[i])
+			fsg_lun_fsync_sub(common->luns[i]);
+	up_read(&common->filesem);
 }
 
 
@@ -2861,6 +2906,7 @@ static void handle_exception(struct fsg_common *common)
 			if (!curlun)
 				continue;
 			curlun->prevent_medium_removal = 0;
+			WRITE_ONCE(curlun->host_stopped, false);
 			curlun->sense_data = SS_NO_SENSE;
 			curlun->unit_attention_data = SS_NO_SENSE;
 			curlun->sense_data_info = 0;
@@ -3078,6 +3124,7 @@ static struct fsg_common *fsg_common_setup(struct fsg_common *common)
 	init_completion(&common->thread_notifier);
 	init_waitqueue_head(&common->io_wait);
 	init_waitqueue_head(&common->fsg_wait);
+	INIT_WORK(&common->sync_work, fsg_sync_work);
 	common->state = FSG_STATE_TERMINATED;
 	memset(common->luns, 0, sizeof(common->luns));
 
@@ -3372,6 +3419,7 @@ static void fsg_common_release(struct fsg_common *common)
 		raise_exception(common, FSG_STATE_EXIT);
 		wait_for_completion(&common->thread_notifier);
 	}
+	cancel_work_sync(&common->sync_work);
 
 	for (i = 0; i < ARRAY_SIZE(common->luns); ++i) {
 		struct fsg_lun *lun = common->luns[i];
@@ -3634,6 +3682,14 @@ static ssize_t fsg_lun_opts_forced_eject_store(struct config_item *item,
 
 CONFIGFS_ATTR_WO(fsg_lun_opts_, forced_eject);
 
+static ssize_t fsg_lun_opts_host_state_show(struct config_item *item,
+					    char *page)
+{
+	return fsg_show_host_state(to_fsg_lun_opts(item)->lun, page);
+}
+
+CONFIGFS_ATTR_RO(fsg_lun_opts_, host_state);
+
 static struct configfs_attribute *fsg_lun_attrs[] = {
 	&fsg_lun_opts_attr_file,
 	&fsg_lun_opts_attr_ro,
@@ -3642,6 +3698,7 @@ static struct configfs_attribute *fsg_lun_attrs[] = {
 	&fsg_lun_opts_attr_nofua,
 	&fsg_lun_opts_attr_inquiry_string,
 	&fsg_lun_opts_attr_forced_eject,
+	&fsg_lun_opts_attr_host_state,
 	NULL,
 };
 
@@ -3940,6 +3997,7 @@ static struct usb_function *fsg_alloc(struct usb_function_instance *fi)
 	fsg->function.setup	= fsg_setup;
 	fsg->function.set_alt	= fsg_set_alt;
 	fsg->function.disable	= fsg_disable;
+	fsg->function.suspend	= fsg_suspend;
 	fsg->function.free_func	= fsg_free;
 
 	fsg->common               = common;

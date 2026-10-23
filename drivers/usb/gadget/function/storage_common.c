@@ -172,6 +172,7 @@ void fsg_lun_close(struct fsg_lun *curlun)
 		fput(curlun->filp);
 		curlun->filp = NULL;
 	}
+	curlun->host_dirty = false;
 }
 EXPORT_SYMBOL_GPL(fsg_lun_close);
 
@@ -267,6 +268,11 @@ int fsg_lun_open(struct fsg_lun *curlun, const char *filename)
 	curlun->filp = filp;
 	curlun->file_length = size;
 	curlun->num_sectors = num_sectors;
+	curlun->host_stopped = false;
+	curlun->host_dirty = false;
+	curlun->host_writes = 0;
+	curlun->host_flushes = 0;
+	curlun->host_last_write = 0;
 	LDBG(curlun, "open backing file: %s\n", filename);
 	return 0;
 
@@ -451,6 +457,8 @@ ssize_t fsg_store_file(struct fsg_lun *curlun, struct rw_semaphore *filesem,
 
 	/* Load new medium */
 	down_write(filesem);
+	/* Whatever the host wrote to the old medium is on disk once it is gone. */
+	fsg_lun_fsync_sub(curlun);
 	if (count > 0 && buf[0]) {
 		/* fsg_lun_open() will close existing file if any. */
 		rc = fsg_lun_open(curlun, buf);
@@ -465,6 +473,26 @@ ssize_t fsg_store_file(struct fsg_lun *curlun, struct rw_semaphore *filesem,
 	return (rc < 0 ? rc : count);
 }
 EXPORT_SYMBOL_GPL(fsg_store_file);
+
+ssize_t fsg_show_host_state(struct fsg_lun *curlun, char *buf)
+{
+	ktime_t last = READ_ONCE(curlun->host_last_write);
+	s64 age = last ? ktime_ms_delta(ktime_get(), last) : -1;
+
+	return sysfs_emit(buf,
+			  "present=%d\nlocked=%d\nstopped=%d\ndirty=%d\n"
+			  "ejects=%u\nwrites=%llu\nflushes=%llu\n"
+			  "write_age_ms=%lld\n",
+			  fsg_lun_is_open(curlun),
+			  curlun->prevent_medium_removal,
+			  READ_ONCE(curlun->host_stopped),
+			  READ_ONCE(curlun->host_dirty),
+			  READ_ONCE(curlun->host_ejects),
+			  READ_ONCE(curlun->host_writes),
+			  READ_ONCE(curlun->host_flushes),
+			  age);
+}
+EXPORT_SYMBOL_GPL(fsg_show_host_state);
 
 ssize_t fsg_store_cdrom(struct fsg_lun *curlun, struct rw_semaphore *filesem,
 			const char *buf, size_t count)
