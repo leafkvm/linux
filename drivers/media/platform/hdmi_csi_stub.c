@@ -715,12 +715,6 @@ static int stub_g_volatile_ctrl(struct v4l2_ctrl *ctrl)
 
 	mutex_lock(&st->lock);
 	switch (ctrl->id) {
-	case HDMI_CSI_CID_AUDIO_SAMPLING_RATE:
-		*ctrl->p_new.p_s32 = st->audio_sample_rate;
-		break;
-	case HDMI_CSI_CID_AUDIO_PRESENT:
-		*ctrl->p_new.p_s32 = st->audio_present ? 1 : 0;
-		break;
 	case V4L2_CID_PIXEL_RATE:
 		*ctrl->p_new.p_s64 = (s64)st->timings.bt.pixelclock;
 		break;
@@ -743,7 +737,7 @@ static const struct v4l2_ctrl_config stub_ctrl_audio_sampling_rate = {
 	.max  = 768000,
 	.step = 1,
 	.def  = 0,
-	.flags = V4L2_CTRL_FLAG_READ_ONLY | V4L2_CTRL_FLAG_VOLATILE,
+	.flags = V4L2_CTRL_FLAG_READ_ONLY,
 };
 
 static const struct v4l2_ctrl_config stub_ctrl_audio_present = {
@@ -755,12 +749,37 @@ static const struct v4l2_ctrl_config stub_ctrl_audio_present = {
 	.max  = 1,
 	.step = 1,
 	.def  = 0,
-	.flags = V4L2_CTRL_FLAG_READ_ONLY | V4L2_CTRL_FLAG_VOLATILE,
+	.flags = V4L2_CTRL_FLAG_READ_ONLY,
 };
 
 /* ------------------------------------------------------------------ */
 /* Misc device - daemon communication                                  */
 /* ------------------------------------------------------------------ */
+
+/*
+ * The audio controls are not volatile so that V4L2_EVENT_CTRL_CH_VALUE is
+ * emitted on every change.  They are set outside st->lock, because the
+ * control handler lock nests outside st->lock in stub_g_volatile_ctrl().
+ * Rate is published before present on the way up and after it on the way
+ * down, so a consumer woken by either event never sees present=1 with a
+ * stale rate.
+ */
+static void stub_set_audio(struct hdmi_csi_stub_state *st, bool present,
+			   u32 rate)
+{
+	mutex_lock(&st->lock);
+	st->audio_sample_rate = rate;
+	st->audio_present = present;
+	mutex_unlock(&st->lock);
+
+	if (present) {
+		v4l2_ctrl_s_ctrl(st->audio_sampling_rate_ctrl, rate);
+		v4l2_ctrl_s_ctrl(st->audio_present_ctrl, 1);
+	} else {
+		v4l2_ctrl_s_ctrl(st->audio_present_ctrl, 0);
+		v4l2_ctrl_s_ctrl(st->audio_sampling_rate_ctrl, rate);
+	}
+}
 
 static int misc_open(struct inode *inode, struct file *filp)
 {
@@ -796,11 +815,12 @@ static int misc_release(struct inode *inode, struct file *filp)
 		memset(&st->timings, 0, sizeof(st->timings));
 		st->quantization = V4L2_QUANTIZATION_DEFAULT;
 		st->colorspace = V4L2_COLORSPACE_DEFAULT;
-		st->audio_present = false;
-		st->audio_sample_rate = 0;
 		fire_source_change(st);
 	}
 	mutex_unlock(&st->lock);
+
+	/* Nobody reports audio loss without the daemon, so drop it now */
+	stub_set_audio(st, false, 0);
 
 	return 0;
 }
@@ -971,17 +991,7 @@ static long misc_ioctl_report_audio(struct hdmi_csi_stub_state *st,
 	if (copy_from_user(&ai, arg, sizeof(ai)))
 		return -EFAULT;
 
-	mutex_lock(&st->lock);
-	st->audio_sample_rate = ai.sample_rate;
-	st->audio_present = !!ai.present;
-
-	if (st->audio_sampling_rate_ctrl)
-		v4l2_ctrl_s_ctrl(st->audio_sampling_rate_ctrl,
-				 st->audio_sample_rate);
-	if (st->audio_present_ctrl)
-		v4l2_ctrl_s_ctrl(st->audio_present_ctrl,
-				 st->audio_present ? 1 : 0);
-	mutex_unlock(&st->lock);
+	stub_set_audio(st, !!ai.present, ai.sample_rate);
 
 	return 0;
 }
