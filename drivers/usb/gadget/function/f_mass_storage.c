@@ -2051,6 +2051,16 @@ static void send_status(struct fsg_common *common)
  * Check whether the command is properly formed and whether its data size
  * and direction agree with the values we already have.
  */
+/*
+ * The host was told the LUN is empty. Userspace waits for this after
+ * ejecting, so the next medium is not mistaken for the old one by a
+ * host that only polls for media changes.
+ */
+static void fsg_lun_count_no_medium(struct fsg_lun *curlun)
+{
+	WRITE_ONCE(curlun->host_no_medium, curlun->host_no_medium + 1);
+}
+
 static int check_command(struct fsg_common *common, int cmnd_size,
 			 enum data_direction data_dir, unsigned int mask,
 			 int needs_medium, const char *name)
@@ -2156,6 +2166,8 @@ static int check_command(struct fsg_common *common, int cmnd_size,
 	    common->cmnd[0] != REQUEST_SENSE) {
 		curlun->sense_data = curlun->unit_attention_data;
 		curlun->unit_attention_data = SS_NO_SENSE;
+		if (curlun->sense_data == SS_MEDIUM_NOT_PRESENT)
+			fsg_lun_count_no_medium(curlun);
 		return -EINVAL;
 	}
 
@@ -2173,6 +2185,7 @@ static int check_command(struct fsg_common *common, int cmnd_size,
 	 * it, return an error. */
 	if (curlun && !fsg_lun_is_open(curlun) && needs_medium) {
 		curlun->sense_data = SS_MEDIUM_NOT_PRESENT;
+		fsg_lun_count_no_medium(curlun);
 		return -EINVAL;
 	}
 

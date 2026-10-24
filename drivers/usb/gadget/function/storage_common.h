@@ -178,6 +178,7 @@ struct fsg_lun {
 	bool		host_stopped;	/* START STOP UNIT with Start=0 */
 	bool		host_dirty;	/* writes since the host's last flush */
 	u32		host_ejects;	/* media ejected by the host (LoEj) */
+	u32		host_no_medium;	/* commands failed with "medium not present" */
 	u64		host_writes;	/* WRITE commands */
 	u64		host_flushes;	/* SYNCHRONIZE CACHE / unlock flushes */
 	ktime_t		host_last_write;
