@@ -168,6 +168,10 @@ struct hdmi_csi_stub_state {
 	u32				audio_sample_rate;
 	bool				audio_present;
 
+	/* Receiver progress: daemon fields only, sequence stays zero */
+	struct hdmi_csi_status		status;
+	u32				status_sequence;
+
 	/* EDID storage */
 	u8				edid[EDID_NUM_BLOCKS_MAX * EDID_BLOCK_SIZE];
 	u8				edid_blocks;
@@ -279,6 +283,52 @@ static void fire_source_change(struct hdmi_csi_stub_state *st)
 		v4l2_subdev_notify_event(&st->sd, &ev);
 }
 
+static void get_status(struct hdmi_csi_stub_state *st,
+		       struct hdmi_csi_status *status)
+{
+	mutex_lock(&st->lock);
+	*status = st->status;
+	status->sequence = st->status_sequence;
+	mutex_unlock(&st->lock);
+}
+
+/*
+ * Replace the daemon's status. Without published video, a stage change is
+ * also a source change: it is the only sign that the reason for the missing
+ * signal moved on. Caller must hold st->lock.
+ */
+static void set_status_locked(struct hdmi_csi_stub_state *st,
+			      const struct hdmi_csi_status *status)
+{
+	bool restaged = st->status.rx_stage != status->rx_stage;
+
+	st->status = *status;
+	st->status_sequence++;
+	if (restaged && !st->signal_present)
+		fire_source_change(st);
+}
+
+/* V4L2 input status bits for the current state. Caller must hold st->lock. */
+static u32 input_status_locked(const struct hdmi_csi_stub_state *st)
+{
+	if (st->signal_present)
+		return 0;
+
+	switch (st->status.rx_stage) {
+	case HDMI_CSI_RX_NO_SOURCE:
+		return V4L2_IN_ST_NO_POWER | V4L2_IN_ST_NO_SIGNAL |
+		       V4L2_IN_ST_NO_SYNC;
+	case HDMI_CSI_RX_UNKNOWN:
+	case HDMI_CSI_RX_NO_EDID:
+	case HDMI_CSI_RX_CONNECTING:
+	case HDMI_CSI_RX_WAIT_CLOCK:
+		return V4L2_IN_ST_NO_SIGNAL | V4L2_IN_ST_NO_SYNC;
+	default:
+		/* Signal present but not (or not usably) locked. */
+		return V4L2_IN_ST_NO_SYNC;
+	}
+}
+
 /* ------------------------------------------------------------------ */
 /* V4L2 subdev - core ops                                              */
 /* ------------------------------------------------------------------ */
@@ -308,6 +358,9 @@ static int stub_log_status(struct v4l2_subdev *sd)
 			  st->audio_sample_rate);
 	v4l2_info(sd, "Daemon connected: %s\n",
 		  st->daemon_open ? "yes" : "no");
+	v4l2_info(sd, "Receiver stage: %u, last error: %u (x%u)\n",
+		  st->status.rx_stage, st->status.last_error,
+		  st->status.error_count);
 
 	return 0;
 }
@@ -340,6 +393,9 @@ static long stub_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)
 	case HDMI_CSI_IOC_GET_VIDEO:
 		get_video(st, arg);
 		return 0;
+	case HDMI_CSI_IOC_GET_STATUS:
+		get_status(st, arg);
+		return 0;
 	case RKMODULE_GET_HDMI_MODE:
 		*(int *)arg = RKMODULE_HDMIIN_MODE;
 		return 0;
@@ -359,6 +415,7 @@ static long stub_compat_ioctl32(struct v4l2_subdev *sd,
 {
 	void __user *up = compat_ptr(arg);
 	struct hdmi_csi_video video;
+	struct hdmi_csi_status status;
 	int *seq;
 	long ret;
 
@@ -366,6 +423,9 @@ static long stub_compat_ioctl32(struct v4l2_subdev *sd,
 	case HDMI_CSI_IOC_GET_VIDEO:
 		get_video(sd_to_state(sd), &video);
 		return copy_to_user(up, &video, sizeof(video)) ? -EFAULT : 0;
+	case HDMI_CSI_IOC_GET_STATUS:
+		get_status(sd_to_state(sd), &status);
+		return copy_to_user(up, &status, sizeof(status)) ? -EFAULT : 0;
 	case RKMODULE_GET_HDMI_MODE:
 	case RK_HDMIRX_CMD_GET_SIGNAL_STABLE_STATUS:
 		seq = kzalloc(sizeof(*seq), GFP_KERNEL);
@@ -402,9 +462,7 @@ static int stub_g_input_status(struct v4l2_subdev *sd, u32 *status)
 	struct hdmi_csi_stub_state *st = sd_to_state(sd);
 
 	mutex_lock(&st->lock);
-	*status = 0;
-	if (!st->signal_present)
-		*status |= V4L2_IN_ST_NO_SIGNAL | V4L2_IN_ST_NO_SYNC;
+	*status = input_status_locked(st);
 	mutex_unlock(&st->lock);
 
 	return 0;
@@ -802,6 +860,7 @@ static int misc_release(struct inode *inode, struct file *filp)
 {
 	struct miscdevice *m = filp->private_data;
 	struct hdmi_csi_stub_state *st = misc_to_state(m);
+	static const struct hdmi_csi_status unknown;
 
 	mutex_lock(&st->lock);
 	st->daemon_open = false;
@@ -817,6 +876,8 @@ static int misc_release(struct inode *inode, struct file *filp)
 		st->colorspace = V4L2_COLORSPACE_DEFAULT;
 		fire_source_change(st);
 	}
+	/* Nothing the daemon described is known any more */
+	set_status_locked(st, &unknown);
 	mutex_unlock(&st->lock);
 
 	/* Nobody reports audio loss without the daemon, so drop it now */
@@ -976,6 +1037,7 @@ static long misc_ioctl_get_caps(void __user *arg)
 	struct hdmi_csi_caps caps = {
 		.abi_version = HDMI_CSI_ABI_VERSION,
 		.num_mbus_codes = ARRAY_SIZE(hdmi_csi_mbus_codes),
+		.features = HDMI_CSI_FEAT_STATUS,
 	};
 
 	BUILD_BUG_ON(ARRAY_SIZE(hdmi_csi_mbus_codes) > HDMI_CSI_MAX_MBUS_CODES);
@@ -993,6 +1055,27 @@ static long misc_ioctl_report_audio(struct hdmi_csi_stub_state *st,
 
 	stub_set_audio(st, !!ai.present, ai.sample_rate);
 
+	return 0;
+}
+
+static long misc_ioctl_report_status(struct hdmi_csi_stub_state *st,
+				     void __user *arg)
+{
+	struct hdmi_csi_status s;
+
+	if (copy_from_user(&s, arg, sizeof(s)))
+		return -EFAULT;
+
+	if (s.rx_stage == HDMI_CSI_RX_UNKNOWN ||
+	    s.rx_stage > HDMI_CSI_RX_LOCKED ||
+	    s.last_error > HDMI_CSI_ERR_MAX ||
+	    s.reserved1 || memchr_inv(s.reserved, 0, sizeof(s.reserved)) ||
+	    s.sequence)
+		return -EINVAL;
+
+	mutex_lock(&st->lock);
+	set_status_locked(st, &s);
+	mutex_unlock(&st->lock);
 	return 0;
 }
 
@@ -1065,6 +1148,14 @@ static long misc_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		get_video(st, &video);
 		return copy_to_user(uarg, &video, sizeof(video)) ? -EFAULT : 0;
 	}
+	case HDMI_CSI_IOC_GET_STATUS: {
+		struct hdmi_csi_status status;
+
+		get_status(st, &status);
+		return copy_to_user(uarg, &status, sizeof(status)) ? -EFAULT : 0;
+	}
+	case HDMI_CSI_IOC_REPORT_STATUS:
+		return misc_ioctl_report_status(st, uarg);
 	case HDMI_CSI_IOC_GET_CAPS:
 		return misc_ioctl_get_caps(uarg);
 	case HDMI_CSI_IOC_REPORT_VIDEO:

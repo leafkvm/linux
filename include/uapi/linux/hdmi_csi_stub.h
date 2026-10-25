@@ -113,13 +113,18 @@ struct hdmi_csi_video {
  * Query after opening the misc device, before reporting video. Formats describe
  * stub support; capture clients must also configure a compatible CSI pipeline.
  * The capability list is fixed for the lifetime of the open daemon connection.
+ * features lists additions that do not change the ABI version; a daemon must
+ * not use an ioctl whose feature bit is clear.
  */
 struct hdmi_csi_caps {
 	__u32 abi_version;
 	__u32 num_mbus_codes;
 	__u32 mbus_codes[HDMI_CSI_MAX_MBUS_CODES];
-	__u32 reserved[6];
+	__u32 features;		/* HDMI_CSI_FEAT_* */
+	__u32 reserved[5];
 };
+
+#define HDMI_CSI_FEAT_STATUS		(1 << 0) /* REPORT_STATUS / GET_STATUS */
 
 /**
  * struct hdmi_csi_audio_info - Audio status reported by the daemon.
@@ -159,6 +164,51 @@ struct hdmi_csi_stream_status {
 	__u32 sequence;		/* increments whenever stream_on changes */
 };
 
+/*
+ * Receiver progress, in bring-up order. A stage names what the receiver is
+ * waiting for, so a stuck stage says what is missing.
+ */
+#define HDMI_CSI_RX_UNKNOWN		0  /* no daemon, or no status reported */
+#define HDMI_CSI_RX_NO_EDID		1  /* no EDID loaded; hotplug held low */
+#define HDMI_CSI_RX_NO_SOURCE		2  /* no +5V from a source */
+#define HDMI_CSI_RX_CONNECTING		3  /* source present; hotplug about to rise */
+#define HDMI_CSI_RX_WAIT_CLOCK		4  /* hotplug high; no stable link clock */
+#define HDMI_CSI_RX_LINK_SETUP		5  /* clock stable; receiver PHY training */
+#define HDMI_CSI_RX_WAIT_INFOFRAME	6  /* link up; infoframes not consistent */
+#define HDMI_CSI_RX_WAIT_SYNC		7  /* video timing not settled */
+#define HDMI_CSI_RX_LOCKED		8  /* video timing locked */
+
+/* Cause of the most recent failure; the receiver retries after each. */
+#define HDMI_CSI_ERR_NONE		0
+#define HDMI_CSI_ERR_CLOCK_LOST		1  /* link clock dropped or went unstable */
+#define HDMI_CSI_ERR_LINK_SETUP		2  /* PHY calibration or equalization failed */
+#define HDMI_CSI_ERR_INFOFRAME		3  /* infoframes inconsistent */
+#define HDMI_CSI_ERR_NO_SYNC		4  /* video timing never settled */
+#define HDMI_CSI_ERR_SYNC_LOST		5  /* locked video timing went unstable */
+#define HDMI_CSI_ERR_BAD_TIMING		6  /* measured timing cannot be output */
+#define HDMI_CSI_ERR_FORMAT		7  /* input pixel format cannot be output */
+#define HDMI_CSI_ERR_MAX		HDMI_CSI_ERR_FORMAT
+
+/**
+ * struct hdmi_csi_status - Receiver progress, owned by the daemon.
+ *
+ * Says where the input bring-up is and why it last failed, in terms that do
+ * not depend on the bridge chip; details belong in the daemon's log. The
+ * daemon reports it whenever a field changes; consumers read it with
+ * GET_STATUS. Without published video, an rx_stage change also fires
+ * V4L2_EVENT_SOURCE_CHANGE. The kernel resets it to HDMI_CSI_RX_UNKNOWN when
+ * the daemon closes.
+ */
+struct hdmi_csi_status {
+	__u8  rx_stage;		/* HDMI_CSI_RX_* */
+	__u8  last_error;	/* HDMI_CSI_ERR_*; kept after a later lock */
+	__u16 reserved1;
+	__u32 error_count;	/* consecutive last_error failures; 0 once locked */
+	__u32 reserved[4];	/* zero-filled */
+	__u32 sequence;		/* set by the kernel on GET_STATUS: increments on
+				 * every change; zero in REPORT_STATUS */
+};
+
 /* ------------------------------------------------------------------ */
 /* IOCTLs                                                             */
 /* ------------------------------------------------------------------ */
@@ -192,6 +242,14 @@ struct hdmi_csi_stream_status {
  */
 #define HDMI_CSI_IOC_GET_VIDEO \
 	_IOR(HDMI_CSI_STUB_IOC_MAGIC, 6, struct hdmi_csi_video)
+
+/* Daemon -> kernel: publish receiver progress (HDMI_CSI_FEAT_STATUS). */
+#define HDMI_CSI_IOC_REPORT_STATUS \
+	_IOW(HDMI_CSI_STUB_IOC_MAGIC, 7, struct hdmi_csi_status)
+
+/* Read the receiver progress on the misc device or V4L2 subdevice. */
+#define HDMI_CSI_IOC_GET_STATUS \
+	_IOR(HDMI_CSI_STUB_IOC_MAGIC, 8, struct hdmi_csi_status)
 
 /* ------------------------------------------------------------------ */
 /* Events (delivered to daemon via read() on the misc device fd)      */
