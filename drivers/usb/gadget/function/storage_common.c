@@ -273,6 +273,10 @@ int fsg_lun_open(struct fsg_lun *curlun, const char *filename)
 	curlun->host_writes = 0;
 	curlun->host_flushes = 0;
 	curlun->host_last_write = 0;
+	curlun->host_read_bytes = 0;
+	curlun->host_write_bytes = 0;
+	curlun->host_read_errors = 0;
+	curlun->host_write_errors = 0;
 	LDBG(curlun, "open backing file: %s\n", filename);
 	return 0;
 
@@ -482,7 +486,9 @@ ssize_t fsg_show_host_state(struct fsg_lun *curlun, char *buf)
 	return sysfs_emit(buf,
 			  "present=%d\nlocked=%d\nstopped=%d\ndirty=%d\n"
 			  "ejects=%u\nwrites=%llu\nflushes=%llu\n"
-			  "write_age_ms=%lld\nno_medium=%u\n",
+			  "write_age_ms=%lld\nno_medium=%u\n"
+			  "read_bytes=%llu\nwrite_bytes=%llu\n"
+			  "read_errors=%llu\nwrite_errors=%llu\n",
 			  fsg_lun_is_open(curlun),
 			  curlun->prevent_medium_removal,
 			  READ_ONCE(curlun->host_stopped),
@@ -491,7 +497,11 @@ ssize_t fsg_show_host_state(struct fsg_lun *curlun, char *buf)
 			  READ_ONCE(curlun->host_writes),
 			  READ_ONCE(curlun->host_flushes),
 			  age,
-			  READ_ONCE(curlun->host_no_medium));
+			  READ_ONCE(curlun->host_no_medium),
+			  READ_ONCE(curlun->host_read_bytes),
+			  READ_ONCE(curlun->host_write_bytes),
+			  READ_ONCE(curlun->host_read_errors),
+			  READ_ONCE(curlun->host_write_errors));
 }
 EXPORT_SYMBOL_GPL(fsg_show_host_state);
 

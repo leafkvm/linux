@@ -701,6 +701,8 @@ static int do_read(struct fsg_common *common)
 		file_offset  += nread;
 		amount_left  -= nread;
 		common->residue -= nread;
+		WRITE_ONCE(curlun->host_read_bytes,
+			   curlun->host_read_bytes + nread);
 
 		/*
 		 * Except at the end of the transfer, nread will be
@@ -716,6 +718,8 @@ static int do_read(struct fsg_common *common)
 			curlun->sense_data_info =
 					file_offset >> curlun->blkbits;
 			curlun->info_valid = 1;
+			WRITE_ONCE(curlun->host_read_errors,
+				   curlun->host_read_errors + 1);
 			break;
 		}
 
@@ -906,6 +910,8 @@ static int do_write(struct fsg_common *common)
 		file_offset += nwritten;
 		amount_left_to_write -= nwritten;
 		common->residue -= nwritten;
+		WRITE_ONCE(curlun->host_write_bytes,
+			   curlun->host_write_bytes + nwritten);
 
 		/* If an error occurred, report it and its position */
 		if (nwritten < amount) {
@@ -913,6 +919,8 @@ static int do_write(struct fsg_common *common)
 			curlun->sense_data_info =
 					file_offset >> curlun->blkbits;
 			curlun->info_valid = 1;
+			WRITE_ONCE(curlun->host_write_errors,
+				   curlun->host_write_errors + 1);
 			break;
 		}
 

@@ -182,6 +182,10 @@ struct fsg_lun {
 	u64		host_writes;	/* WRITE commands */
 	u64		host_flushes;	/* SYNCHRONIZE CACHE / unlock flushes */
 	ktime_t		host_last_write;
+	u64		host_read_bytes;	/* sent to the host */
+	u64		host_write_bytes;	/* written to the backing file */
+	u64		host_read_errors;	/* failed READ commands */
+	u64		host_write_errors;	/* failed WRITE commands */
 };
 
 static inline bool fsg_lun_is_open(struct fsg_lun *curlun)
