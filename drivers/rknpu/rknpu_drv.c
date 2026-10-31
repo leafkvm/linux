@@ -54,7 +54,9 @@
 #endif
 
 #ifdef CONFIG_ROCKCHIP_RKNPU_DMA_HEAP
+#ifdef CONFIG_ROCKCHIP_RKNPU_LEGACY_ALLOC
 #include <linux/rk-dma-heap.h>
+#endif
 #include "rknpu_mem.h"
 #endif
 
@@ -1378,6 +1380,20 @@ static int rknpu_probe(struct platform_device *pdev)
 		}
 	}
 
+#ifdef CONFIG_ROCKCHIP_RKNPU_DMA_HEAP
+	ret = dma_coerce_mask_and_coherent(dev, config->dma_mask);
+	if (ret)
+		return ret;
+	if (!dev->dma_parms) {
+		dev->dma_parms = devm_kzalloc(dev, sizeof(*dev->dma_parms), GFP_KERNEL);
+		if (!dev->dma_parms)
+			return -ENOMEM;
+	}
+	ret = dma_set_max_seg_size(dev, UINT_MAX);
+	if (ret)
+		return ret;
+#endif
+
 	rknpu_dev->bypass_irq_handler = bypass_irq_handler;
 	rknpu_dev->bypass_soft_reset = bypass_soft_reset;
 
@@ -1493,13 +1509,14 @@ static int rknpu_probe(struct platform_device *pdev)
 		return ret;
 	}
 
+#ifdef CONFIG_ROCKCHIP_RKNPU_LEGACY_ALLOC
 	rknpu_dev->heap = rk_dma_heap_find("rk-dma-heap-cma");
 	if (!rknpu_dev->heap) {
 		LOG_DEV_ERROR(dev, "failed to find cma heap\n");
 		misc_deregister(&rknpu_dev->miscdev);
 		return -ENOMEM;
 	}
-	rk_dma_heap_set_dev(dev);
+#endif
 	LOG_DEV_INFO(dev, "Initialized %s: v%d.%d.%d for %s\n", DRIVER_DESC,
 		     DRIVER_MAJOR, DRIVER_MINOR, DRIVER_PATCHLEVEL,
 		     DRIVER_DATE);

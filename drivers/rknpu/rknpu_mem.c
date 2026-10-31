@@ -5,7 +5,10 @@
  */
 
 #include <linux/version.h>
+#include <linux/dma-buf.h>
+#ifdef CONFIG_ROCKCHIP_RKNPU_LEGACY_ALLOC
 #include <linux/rk-dma-heap.h>
+#endif
 
 #if KERNEL_VERSION(5, 10, 0) <= LINUX_VERSION_CODE
 #include <linux/dma-map-ops.h>
@@ -85,6 +88,13 @@ int rknpu_mem_create_ioctl(struct rknpu_device *rknpu_dev, struct file *file,
 	unsigned int k_size = sizeof(struct rknpu_mem_create);
 	char *k_data = (char *)&args;
 	struct iosys_map map = { 0 };
+	struct scatterlist *sg;
+	dma_addr_t next;
+	u64 mapped = 0;
+	int i;
+
+	if (in_size > k_size || in_size < offsetof(struct rknpu_mem_create, sram_size))
+		return -EINVAL;
 
 	if (unlikely(copy_from_user(&args, (struct rknpu_mem_create *)data,
 				    in_size))) {
@@ -95,6 +105,9 @@ int rknpu_mem_create_ioctl(struct rknpu_device *rknpu_dev, struct file *file,
 
 	if (k_size > in_size)
 		memset(k_data + in_size, 0, k_size - in_size);
+
+	if (!args.size || args.size > ULONG_MAX - (PAGE_SIZE - 1))
+		return -EINVAL;
 
 	rknpu_obj = kzalloc(sizeof(*rknpu_obj), GFP_KERNEL);
 	if (!rknpu_obj)
@@ -112,7 +125,8 @@ int rknpu_mem_create_ioctl(struct rknpu_device *rknpu_dev, struct file *file,
 		rknpu_obj->dmabuf = dmabuf;
 		rknpu_obj->owner = 0;
 	} else {
-		/* Start test kernel alloc/free dma buf */
+#ifdef CONFIG_ROCKCHIP_RKNPU_LEGACY_ALLOC
+		/* Compatibility path for vendor userspace. */
 		dmabuf = rk_dma_heap_buffer_alloc(rknpu_dev->heap, args.size,
 						  O_CLOEXEC | O_RDWR, 0x0,
 						  dev_name(rknpu_dev->dev));
@@ -132,6 +146,15 @@ int rknpu_mem_create_ioctl(struct rknpu_device *rknpu_dev, struct file *file,
 			ret = -EFAULT;
 			goto err_free_dma_buf;
 		}
+#else
+		ret = -EOPNOTSUPP;
+		goto err_free_obj;
+#endif
+	}
+
+	if (PAGE_ALIGN(args.size) > dmabuf->size) {
+		ret = -EINVAL;
+		goto err_free_dma_buf;
 	}
 
 	attachment = dma_buf_attach(dmabuf, rknpu_dev->dev);
@@ -147,6 +170,23 @@ int rknpu_mem_create_ioctl(struct rknpu_device *rknpu_dev, struct file *file,
 		dma_buf_detach(dmabuf, attachment);
 		ret = PTR_ERR(table);
 		goto err_free_dma_buf;
+	}
+
+	/* The NPU accepts a base address, not a scatter/gather descriptor. */
+	next = sg_dma_address(table->sgl);
+	for_each_sgtable_dma_sg(table, sg, i) {
+		if (sg_dma_address(sg) != next) {
+			ret = -EINVAL;
+			goto err_detach_dma_buf;
+		}
+		mapped += sg_dma_len(sg);
+		next += sg_dma_len(sg);
+		if (mapped >= PAGE_ALIGN(args.size))
+			break;
+	}
+	if (mapped < PAGE_ALIGN(args.size)) {
+		ret = -EINVAL;
+		goto err_detach_dma_buf;
 	}
 
 	if (args.flags & RKNPU_MEM_KERNEL_MAPPING) {
@@ -195,7 +235,8 @@ int rknpu_mem_create_ioctl(struct rknpu_device *rknpu_dev, struct file *file,
 	return 0;
 
 err_unmap_kv_addr:
-	dma_buf_vunmap(rknpu_obj->dmabuf, &map);
+	if (rknpu_obj->kv_addr)
+		dma_buf_vunmap(rknpu_obj->dmabuf, &map);
 	rknpu_obj->kv_addr = NULL;
 
 err_detach_dma_buf:
@@ -203,10 +244,7 @@ err_detach_dma_buf:
 	dma_buf_detach(dmabuf, attachment);
 
 err_free_dma_buf:
-	if (rknpu_obj->owner)
-		rk_dma_heap_buffer_free(dmabuf);
-	else
-		dma_buf_put(dmabuf);
+	dma_buf_put(dmabuf);
 
 err_free_obj:
 	kfree(rknpu_obj);
@@ -278,58 +316,11 @@ int rknpu_mem_destroy_ioctl(struct rknpu_device *rknpu_dev, struct file *file,
 	return 0;
 }
 
-/*
- * begin cpu access => for_cpu = true
- * end cpu access => for_cpu = false
- */
-static void __maybe_unused rknpu_dma_buf_sync(
-	struct rknpu_device *rknpu_dev, struct rknpu_mem_object *rknpu_obj,
-	u32 offset, u32 length, enum dma_data_direction dir, bool for_cpu)
-{
-	struct device *dev = rknpu_dev->dev;
-	struct sg_table *sgt = rknpu_obj->sgt;
-	struct scatterlist *sg = sgt->sgl;
-	dma_addr_t sg_dma_addr = sg_dma_address(sg);
-	unsigned int len = 0;
-	int i;
-
-	for_each_sgtable_sg(sgt, sg, i) {
-		unsigned int sg_offset, sg_left, size = 0;
-
-		len += sg->length;
-		if (len <= offset) {
-			sg_dma_addr += sg->length;
-			continue;
-		}
-
-		sg_left = len - offset;
-		sg_offset = sg->length - sg_left;
-
-		size = (length < sg_left) ? length : sg_left;
-
-		if (for_cpu)
-			dma_sync_single_range_for_cpu(dev, sg_dma_addr,
-						      sg_offset, size, dir);
-		else
-			dma_sync_single_range_for_device(dev, sg_dma_addr,
-							 sg_offset, size, dir);
-
-		offset += size;
-		length -= size;
-		sg_dma_addr += sg->length;
-
-		if (length == 0)
-			break;
-	}
-}
-
 int rknpu_mem_sync_ioctl(struct rknpu_device *rknpu_dev, unsigned long data)
 {
 	struct rknpu_mem_object *rknpu_obj = NULL;
 	struct rknpu_mem_sync args;
-#ifdef CONFIG_DMABUF_PARTIAL
-	struct dma_buf *dmabuf;
-#endif
+
 	int ret = -EFAULT;
 
 	if (unlikely(copy_from_user(&args, (struct rknpu_mem_sync *)data,
@@ -348,26 +339,18 @@ int rknpu_mem_sync_ioctl(struct rknpu_device *rknpu_dev, unsigned long data)
 
 	rknpu_obj = (struct rknpu_mem_object *)(uintptr_t)args.obj_addr;
 
-#ifndef CONFIG_DMABUF_PARTIAL
+	if (args.offset > rknpu_obj->size ||
+	    args.size > rknpu_obj->size - args.offset)
+		return -EINVAL;
+
+	/* Exporters own cache maintenance; syncing the whole buffer is safe. */
 	if (args.flags & RKNPU_MEM_SYNC_TO_DEVICE) {
-		rknpu_dma_buf_sync(rknpu_dev, rknpu_obj, args.offset, args.size,
-				   DMA_TO_DEVICE, false);
+		ret = dma_buf_end_cpu_access(rknpu_obj->dmabuf, DMA_TO_DEVICE);
+		if (ret)
+			return ret;
 	}
-	if (args.flags & RKNPU_MEM_SYNC_FROM_DEVICE) {
-		rknpu_dma_buf_sync(rknpu_dev, rknpu_obj, args.offset, args.size,
-				   DMA_FROM_DEVICE, true);
-	}
-#else
-	dmabuf = rknpu_obj->dmabuf;
-	if (args.flags & RKNPU_MEM_SYNC_TO_DEVICE) {
-		dmabuf->ops->end_cpu_access_partial(dmabuf, DMA_TO_DEVICE,
-						    args.offset, args.size);
-	}
-	if (args.flags & RKNPU_MEM_SYNC_FROM_DEVICE) {
-		dmabuf->ops->begin_cpu_access_partial(dmabuf, DMA_FROM_DEVICE,
-						      args.offset, args.size);
-	}
-#endif
+	if (args.flags & RKNPU_MEM_SYNC_FROM_DEVICE)
+		return dma_buf_begin_cpu_access(rknpu_obj->dmabuf, DMA_FROM_DEVICE);
 
 	return 0;
 }

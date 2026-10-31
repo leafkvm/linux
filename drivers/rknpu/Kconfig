@@ -4,7 +4,7 @@ menu "RKNPU"
 
 config ROCKCHIP_RKNPU
 	tristate "ROCKCHIP_RKNPU"
-	depends on DRM || DMABUF_HEAPS_ROCKCHIP_CMA_HEAP
+	depends on DRM || DMA_SHARED_BUFFER
 	help
 	  rknpu module.
 
@@ -49,11 +49,20 @@ config ROCKCHIP_RKNPU_DRM_GEM
 
 config ROCKCHIP_RKNPU_DMA_HEAP
 	bool "RKNPU DMA heap"
-	depends on DMABUF_HEAPS_ROCKCHIP_CMA_HEAP
+	depends on DMA_SHARED_BUFFER
 	help
-	  Enable RKNPU memory manager by DMA Heap.
+	  Import userspace-allocated DMA-BUFs, including system-heap buffers
+	  on devices with an IOMMU. CMA is not required.
 
 endchoice
+
+config ROCKCHIP_RKNPU_LEGACY_ALLOC
+	bool "RKNPU legacy kernel CMA allocation"
+	depends on ROCKCHIP_RKNPU_DMA_HEAP && DMABUF_HEAPS_ROCKCHIP_CMA_HEAP
+	default y
+	help
+	  Keep the vendor MEM_CREATE allocation path. When disabled, userspace
+	  must allocate a DMA-BUF and pass its fd to MEM_CREATE for import.
 
 endif
 
