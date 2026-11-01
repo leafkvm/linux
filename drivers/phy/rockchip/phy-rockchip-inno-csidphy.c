@@ -2,7 +2,7 @@
 /*
  * Rockchip MIPI RX Innosilicon DPHY driver
  *
- * Copyright (C) 2021 Rockchip Electronics Co., Ltd.
+ * Copyright (C) 2021 Fuzhou Rockchip Electronics Co., Ltd.
  */
 
 #include <linux/bitfield.h>
@@ -17,6 +17,7 @@
 #include <linux/phy/phy-mipi-dphy.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/reset.h>
 
@@ -27,8 +28,17 @@
 
 #define RK3368_GRF_SOC_CON6_OFFSET	0x0418
 
+#define RK3562_GRF_VI_CON0		0x0520
+#define RK3562_GRF_VI_CON1		0x0524
+
 #define RK3568_GRF_VI_CON0		0x0340
 #define RK3568_GRF_VI_CON1		0x0344
+
+#define RK3588_CSIDPHY_GRF_CON0		0x0000
+
+#define RV1126B_GRF_CSIPHY0_CON		0x50010
+#define RV1126B_GRF_CSIPHY1_CON		0x50014
+#define RV1126B_GRF_MISC_CON		0x50020
 
 /* PHY */
 #define CSIDPHY_CTRL_LANE_ENABLE		0x00
@@ -46,6 +56,14 @@
 #define CSIDPHY_CTRL_DIG_RST			0x80
 #define CSIDPHY_CTRL_DIG_RST_UNDEFINED		0x1e
 #define CSIDPHY_CTRL_DIG_RST_RESET		BIT(0)
+
+/* RK3562/RK3572 clock lane mode; must be set after every digital reset. */
+#define RK3562_CSIDPHY_CLK_CONTINUOUS		0x128
+#define CSIDPHY_CLK_CONTINUOUS_MASK		GENMASK(5, 4)
+
+/* RV1126B: MIPI/LVDS selection of the PHY's (full mode) path 0 */
+#define RV1126B_CSIDPHY_PATH0_MODE		0x6cc
+#define CSIDPHY_PATH_MODE_MIPI			0x2
 
 /* offset after ths_settle_offset */
 #define CSIDPHY_CLK_THS_SETTLE			0
@@ -67,6 +85,12 @@
 #define RK1808_CSIDPHY_CLK_CALIB_EN		0x168
 #define RK3568_CSIDPHY_CLK_CALIB_EN		0x168
 
+#define CSIDPHY_LANE_CLK_3_PHASE		0x38
+#define CSIDPHY_CLK_PHASE_MASK			GENMASK(6, 4)
+#define CSIDPHY_CLK_PHASE_DEFAULT		3
+
+#define RESETS_MAX				2
+
 /*
  * The higher 16-bit of this register is used for write protection
  * only if BIT(x + 16) set to 1 the BIT(x) can be written.
@@ -81,37 +105,84 @@ enum dphy_reg_id {
 	GRF_DPHY_CSIPHY_FORCERXMODE,
 	GRF_DPHY_CSIPHY_CLKLANE_EN,
 	GRF_DPHY_CSIPHY_DATALANE_EN,
+	/* full (0) or split (1) lane mode, where the GRF has the switch */
+	GRF_DPHY_CSIPHY_LANE_SEL,
+	GRF_DPHY_REG_COUNT,
 };
 
 struct dphy_reg {
 	u32 offset;
 	u32 mask;
 	u32 shift;
+	u8 valid;
 };
 
 #define PHY_REG(_offset, _width, _shift) \
-	{ .offset = _offset, .mask = BIT(_width) - 1, .shift = _shift, }
+	{ .offset = _offset, .mask = BIT(_width) - 1, .shift = _shift, .valid = 1, }
 
-static const struct dphy_reg rk1808_grf_dphy_regs[] = {
+static const struct dphy_reg rk1808_grf_dphy_regs[GRF_DPHY_REG_COUNT] = {
 	[GRF_DPHY_CSIPHY_FORCERXMODE] = PHY_REG(RK1808_GRF_PD_VI_CON_OFFSET, 4, 0),
 	[GRF_DPHY_CSIPHY_CLKLANE_EN] = PHY_REG(RK1808_GRF_PD_VI_CON_OFFSET, 1, 8),
 	[GRF_DPHY_CSIPHY_DATALANE_EN] = PHY_REG(RK1808_GRF_PD_VI_CON_OFFSET, 4, 4),
 };
 
-static const struct dphy_reg rk3326_grf_dphy_regs[] = {
+static const struct dphy_reg rk3326_grf_dphy_regs[GRF_DPHY_REG_COUNT] = {
 	[GRF_DPHY_CSIPHY_FORCERXMODE] = PHY_REG(RK3326_GRF_PD_VI_CON_OFFSET, 4, 0),
 	[GRF_DPHY_CSIPHY_CLKLANE_EN] = PHY_REG(RK3326_GRF_PD_VI_CON_OFFSET, 1, 8),
 	[GRF_DPHY_CSIPHY_DATALANE_EN] = PHY_REG(RK3326_GRF_PD_VI_CON_OFFSET, 4, 4),
 };
 
-static const struct dphy_reg rk3368_grf_dphy_regs[] = {
+static const struct dphy_reg rk3368_grf_dphy_regs[GRF_DPHY_REG_COUNT] = {
 	[GRF_DPHY_CSIPHY_FORCERXMODE] = PHY_REG(RK3368_GRF_SOC_CON6_OFFSET, 4, 8),
 };
 
-static const struct dphy_reg rk3568_grf_dphy_regs[] = {
+/*
+ * RK3562: identical PHY block and GRF bit layout to RK3568, but the GRF
+ * control words sit at VI_CON0 (0x0520) for DPHY0 and VI_CON1 (0x0524) for
+ * DPHY1.  The instance is told apart by its register base.
+ */
+static const struct dphy_reg rk3562_dphy0_grf_dphy_regs[GRF_DPHY_REG_COUNT] = {
+	[GRF_DPHY_CSIPHY_FORCERXMODE] = PHY_REG(RK3562_GRF_VI_CON0, 4, 0),
+	[GRF_DPHY_CSIPHY_DATALANE_EN] = PHY_REG(RK3562_GRF_VI_CON0, 4, 4),
+	[GRF_DPHY_CSIPHY_CLKLANE_EN] = PHY_REG(RK3562_GRF_VI_CON0, 1, 8),
+};
+
+static const struct dphy_reg rk3562_dphy1_grf_dphy_regs[GRF_DPHY_REG_COUNT] = {
+	[GRF_DPHY_CSIPHY_FORCERXMODE] = PHY_REG(RK3562_GRF_VI_CON1, 4, 0),
+	[GRF_DPHY_CSIPHY_DATALANE_EN] = PHY_REG(RK3562_GRF_VI_CON1, 4, 4),
+	[GRF_DPHY_CSIPHY_CLKLANE_EN] = PHY_REG(RK3562_GRF_VI_CON1, 1, 8),
+};
+
+static const struct dphy_reg rk3568_grf_dphy_regs[GRF_DPHY_REG_COUNT] = {
 	[GRF_DPHY_CSIPHY_FORCERXMODE] = PHY_REG(RK3568_GRF_VI_CON0, 4, 0),
 	[GRF_DPHY_CSIPHY_DATALANE_EN] = PHY_REG(RK3568_GRF_VI_CON0, 4, 4),
 	[GRF_DPHY_CSIPHY_CLKLANE_EN] = PHY_REG(RK3568_GRF_VI_CON0, 1, 8),
+};
+
+static const struct dphy_reg rk3588_grf_dphy_regs[GRF_DPHY_REG_COUNT] = {
+	[GRF_DPHY_CSIPHY_FORCERXMODE] = PHY_REG(RK3588_CSIDPHY_GRF_CON0, 4, 0),
+	[GRF_DPHY_CSIPHY_DATALANE_EN] = PHY_REG(RK3588_CSIDPHY_GRF_CON0, 4, 4),
+	[GRF_DPHY_CSIPHY_CLKLANE_EN] = PHY_REG(RK3588_CSIDPHY_GRF_CON0, 1, 8),
+};
+
+/*
+ * RV1126B: the RK3562 PHY block and GRF bit layout, with one control word
+ * per PHY in the VI GRF and the full/split lane switch of both PHYs in
+ * MISC_CON (bit 0: DPHY0, bit 1: DPHY1).  Values from the vendor
+ * phy-rockchip-csi2-dphy-hw.c; full mode only.
+ */
+static const struct dphy_reg rv1126b_dphy0_grf_dphy_regs[GRF_DPHY_REG_COUNT] = {
+	[GRF_DPHY_CSIPHY_FORCERXMODE] = PHY_REG(RV1126B_GRF_CSIPHY0_CON, 4, 0),
+	[GRF_DPHY_CSIPHY_DATALANE_EN] = PHY_REG(RV1126B_GRF_CSIPHY0_CON, 4, 4),
+	[GRF_DPHY_CSIPHY_CLKLANE_EN] = PHY_REG(RV1126B_GRF_CSIPHY0_CON, 1, 8),
+	[GRF_DPHY_CSIPHY_LANE_SEL] = PHY_REG(RV1126B_GRF_MISC_CON, 1, 0),
+};
+
+static const struct dphy_reg rv1126b_dphy1_grf_dphy_regs[GRF_DPHY_REG_COUNT] = {
+	[GRF_DPHY_CSIPHY_FORCERXMODE] = PHY_REG(RV1126B_GRF_CSIPHY1_CON, 4, 0),
+	[GRF_DPHY_CSIPHY_DATALANE_EN] = PHY_REG(RV1126B_GRF_CSIPHY1_CON, 4, 4),
+	[GRF_DPHY_CSIPHY_CLKLANE_EN] = PHY_REG(RV1126B_GRF_CSIPHY1_CON, 1, 8),
+	[GRF_DPHY_CSIPHY_LANE_SEL] = PHY_REG(RV1126B_GRF_MISC_CON, 1, 1),
 };
 
 struct hsfreq_range {
@@ -119,13 +190,27 @@ struct hsfreq_range {
 	u8 cfg_bit;
 };
 
+/* GRF register set of one PHY instance, selected by its register base */
+struct dphy_instance {
+	resource_size_t reg;
+	const struct dphy_reg *grf_regs;
+};
+
 struct dphy_drv_data {
 	int pwrctl_offset;
 	int ths_settle_offset;
 	int calib_offset;
+	unsigned int clk_continuous_offset; /* zero if unsupported */
+	unsigned int path_mode_offset; /* zero if absent */
 	const struct hsfreq_range *hsfreq_ranges;
 	int num_hsfreq_ranges;
+	/* either one set for all instances ... */
 	const struct dphy_reg *grf_regs;
+	/* ... or one set per instance */
+	const struct dphy_instance *instances;
+	unsigned int num_instances;
+	const char *const *resets;
+	unsigned int resets_num;
 };
 
 struct rockchip_inno_csidphy {
@@ -133,19 +218,22 @@ struct rockchip_inno_csidphy {
 	void __iomem *phy_base;
 	struct clk *pclk;
 	struct regmap *grf;
-	struct reset_control *rst;
+	struct reset_control_bulk_data resets[RESETS_MAX];
+	unsigned int resets_num;
 	const struct dphy_drv_data *drv_data;
+	const struct dphy_reg *grf_regs;
 	struct phy_configure_opts_mipi_dphy config;
 	u8 hsfreq;
+	int clk_phase;
+	bool continuous_clk;
 };
 
 static inline void write_grf_reg(struct rockchip_inno_csidphy *priv,
 				 int index, u8 value)
 {
-	const struct dphy_drv_data *drv_data = priv->drv_data;
-	const struct dphy_reg *reg = &drv_data->grf_regs[index];
+	const struct dphy_reg *reg = &priv->grf_regs[index];
 
-	if (reg->offset)
+	if (reg->valid)
 		regmap_write(priv->grf, reg->offset,
 			     HIWORD_UPDATE(value, reg->mask, reg->shift));
 }
@@ -156,7 +244,7 @@ static const struct hsfreq_range rk1808_mipidphy_hsfreq_ranges[] = {
 	{ 299, 0x06}, { 399, 0x08}, { 499, 0x0b}, { 599, 0x0e},
 	{ 699, 0x10}, { 799, 0x12}, { 999, 0x16}, {1199, 0x1e},
 	{1399, 0x23}, {1599, 0x2d}, {1799, 0x32}, {1999, 0x37},
-	{2199, 0x3c}, {2399, 0x41}, {2499, 0x46}
+	{2199, 0x3c}, {2399, 0x41}, {2500, 0x46}
 };
 
 static const struct hsfreq_range rk3326_mipidphy_hsfreq_ranges[] = {
@@ -171,6 +259,15 @@ static const struct hsfreq_range rk3368_mipidphy_hsfreq_ranges[] = {
 	{ 299, 0x04}, { 399, 0x05}, { 499, 0x06}, { 599, 0x07},
 	{ 699, 0x08}, { 799, 0x09}, { 899, 0x0a}, {1099, 0x0b},
 	{1249, 0x0c}, {1349, 0x0d}, {1500, 0x0e}
+};
+
+static const char *const rk3368_reset_names[] = {
+	"apb"
+};
+
+static const char *const rk3588_reset_names[] = {
+	"apb",
+	"phy"
 };
 
 static void rockchip_inno_csidphy_ths_settle(struct rockchip_inno_csidphy *priv,
@@ -261,8 +358,23 @@ static int rockchip_inno_csidphy_power_on(struct phy *phy)
 	writel(CSIDPHY_CTRL_DIG_RST_UNDEFINED + CSIDPHY_CTRL_DIG_RST_RESET,
 	       priv->phy_base + CSIDPHY_CTRL_DIG_RST);
 
+	/*
+	 * Reset clears this setting. Program it before the transmitter leaves
+	 * LP-11; changing it after the clock lane enters HS is too late.
+	 */
+	if (priv->continuous_clk) {
+		val = readl(priv->phy_base + drv_data->clk_continuous_offset);
+		val |= CSIDPHY_CLK_CONTINUOUS_MASK;
+		writel(val, priv->phy_base + drv_data->clk_continuous_offset);
+	}
+
+	if (drv_data->path_mode_offset)
+		writel(CSIDPHY_PATH_MODE_MIPI,
+		       priv->phy_base + drv_data->path_mode_offset);
+
 	/* not into receive mode/wait stopstate */
 	write_grf_reg(priv, GRF_DPHY_CSIPHY_FORCERXMODE, 0x0);
+	write_grf_reg(priv, GRF_DPHY_CSIPHY_LANE_SEL, 0x0);
 
 	/* enable calibration */
 	if (data_rate_mbps > 1500 && drv_data->calib_offset >= 0) {
@@ -280,6 +392,13 @@ static int rockchip_inno_csidphy_power_on(struct phy *phy)
 	for (i = 0; i < priv->config.lanes; i++)
 		rockchip_inno_csidphy_ths_settle(priv, priv->hsfreq,
 						 CSIDPHY_LANE_THS_SETTLE(i));
+
+	if (priv->clk_phase >= 0) {
+		val = readl(priv->phy_base + CSIDPHY_LANE_CLK_3_PHASE);
+		val &= ~CSIDPHY_CLK_PHASE_MASK;
+		val |= FIELD_PREP(CSIDPHY_CLK_PHASE_MASK, priv->clk_phase);
+		writel(val, priv->phy_base + CSIDPHY_LANE_CLK_3_PHASE);
+	}
 
 	write_grf_reg(priv, GRF_DPHY_CSIPHY_CLKLANE_EN, 0x1);
 	write_grf_reg(priv, GRF_DPHY_CSIPHY_DATALANE_EN,
@@ -343,6 +462,8 @@ static const struct dphy_drv_data rk1808_mipidphy_drv_data = {
 	.hsfreq_ranges = rk1808_mipidphy_hsfreq_ranges,
 	.num_hsfreq_ranges = ARRAY_SIZE(rk1808_mipidphy_hsfreq_ranges),
 	.grf_regs = rk1808_grf_dphy_regs,
+	.resets = rk3368_reset_names,
+	.resets_num = ARRAY_SIZE(rk3368_reset_names),
 };
 
 static const struct dphy_drv_data rk3326_mipidphy_drv_data = {
@@ -352,6 +473,8 @@ static const struct dphy_drv_data rk3326_mipidphy_drv_data = {
 	.hsfreq_ranges = rk3326_mipidphy_hsfreq_ranges,
 	.num_hsfreq_ranges = ARRAY_SIZE(rk3326_mipidphy_hsfreq_ranges),
 	.grf_regs = rk3326_grf_dphy_regs,
+	.resets = rk3368_reset_names,
+	.resets_num = ARRAY_SIZE(rk3368_reset_names),
 };
 
 static const struct dphy_drv_data rk3368_mipidphy_drv_data = {
@@ -361,6 +484,26 @@ static const struct dphy_drv_data rk3368_mipidphy_drv_data = {
 	.hsfreq_ranges = rk3368_mipidphy_hsfreq_ranges,
 	.num_hsfreq_ranges = ARRAY_SIZE(rk3368_mipidphy_hsfreq_ranges),
 	.grf_regs = rk3368_grf_dphy_regs,
+	.resets = rk3368_reset_names,
+	.resets_num = ARRAY_SIZE(rk3368_reset_names),
+};
+
+static const struct dphy_instance rk3562_mipidphy_instances[] = {
+	{ .reg = 0xff3c0000, .grf_regs = rk3562_dphy0_grf_dphy_regs },
+	{ .reg = 0xff3d0000, .grf_regs = rk3562_dphy1_grf_dphy_regs },
+};
+
+static const struct dphy_drv_data rk3562_mipidphy_drv_data = {
+	.pwrctl_offset = -1,
+	.ths_settle_offset = RK3568_CSIDPHY_CLK_WR_THS_SETTLE,
+	.calib_offset = RK3568_CSIDPHY_CLK_CALIB_EN,
+	.clk_continuous_offset = RK3562_CSIDPHY_CLK_CONTINUOUS,
+	.hsfreq_ranges = rk1808_mipidphy_hsfreq_ranges,
+	.num_hsfreq_ranges = ARRAY_SIZE(rk1808_mipidphy_hsfreq_ranges),
+	.instances = rk3562_mipidphy_instances,
+	.num_instances = ARRAY_SIZE(rk3562_mipidphy_instances),
+	.resets = rk3368_reset_names,
+	.resets_num = ARRAY_SIZE(rk3368_reset_names),
 };
 
 static const struct dphy_drv_data rk3568_mipidphy_drv_data = {
@@ -370,6 +513,56 @@ static const struct dphy_drv_data rk3568_mipidphy_drv_data = {
 	.hsfreq_ranges = rk1808_mipidphy_hsfreq_ranges,
 	.num_hsfreq_ranges = ARRAY_SIZE(rk1808_mipidphy_hsfreq_ranges),
 	.grf_regs = rk3568_grf_dphy_regs,
+	.resets = rk3368_reset_names,
+	.resets_num = ARRAY_SIZE(rk3368_reset_names),
+};
+
+static const struct dphy_drv_data rk3588_mipidphy_drv_data = {
+	.pwrctl_offset = -1,
+	.ths_settle_offset = RK3568_CSIDPHY_CLK_WR_THS_SETTLE,
+	.calib_offset = RK3568_CSIDPHY_CLK_CALIB_EN,
+	.hsfreq_ranges = rk1808_mipidphy_hsfreq_ranges,
+	.num_hsfreq_ranges = ARRAY_SIZE(rk1808_mipidphy_hsfreq_ranges),
+	.grf_regs = rk3588_grf_dphy_regs,
+	.resets = rk3588_reset_names,
+	.resets_num = ARRAY_SIZE(rk3588_reset_names),
+};
+
+/*
+ * RK3572: RK3588 layout (one GRF block per PHY, control word at offset 0),
+ * RK3562 clock lane mode register, no separate PHY reset.  Only full mode:
+ * lanes 0..N-1 with clock lane 0, VI_GRF lane_sel left at its 4-lane reset
+ * value.
+ */
+static const struct dphy_drv_data rk3572_mipidphy_drv_data = {
+	.pwrctl_offset = -1,
+	.ths_settle_offset = RK3568_CSIDPHY_CLK_WR_THS_SETTLE,
+	.calib_offset = RK3568_CSIDPHY_CLK_CALIB_EN,
+	.clk_continuous_offset = RK3562_CSIDPHY_CLK_CONTINUOUS,
+	.hsfreq_ranges = rk1808_mipidphy_hsfreq_ranges,
+	.num_hsfreq_ranges = ARRAY_SIZE(rk1808_mipidphy_hsfreq_ranges),
+	.grf_regs = rk3588_grf_dphy_regs,
+	.resets = rk3368_reset_names,
+	.resets_num = ARRAY_SIZE(rk3368_reset_names),
+};
+
+static const struct dphy_instance rv1126b_mipidphy_instances[] = {
+	{ .reg = 0x21c40000, .grf_regs = rv1126b_dphy0_grf_dphy_regs },
+	{ .reg = 0x21c50000, .grf_regs = rv1126b_dphy1_grf_dphy_regs },
+};
+
+static const struct dphy_drv_data rv1126b_mipidphy_drv_data = {
+	.pwrctl_offset = -1,
+	.ths_settle_offset = RK3568_CSIDPHY_CLK_WR_THS_SETTLE,
+	.calib_offset = RK3568_CSIDPHY_CLK_CALIB_EN,
+	.clk_continuous_offset = RK3562_CSIDPHY_CLK_CONTINUOUS,
+	.path_mode_offset = RV1126B_CSIDPHY_PATH0_MODE,
+	.hsfreq_ranges = rk1808_mipidphy_hsfreq_ranges,
+	.num_hsfreq_ranges = ARRAY_SIZE(rk1808_mipidphy_hsfreq_ranges),
+	.instances = rv1126b_mipidphy_instances,
+	.num_instances = ARRAY_SIZE(rv1126b_mipidphy_instances),
+	.resets = rk3368_reset_names,
+	.resets_num = ARRAY_SIZE(rk3368_reset_names),
 };
 
 static const struct of_device_id rockchip_inno_csidphy_match_id[] = {
@@ -390,8 +583,24 @@ static const struct of_device_id rockchip_inno_csidphy_match_id[] = {
 		.data = &rk3368_mipidphy_drv_data,
 	},
 	{
+		.compatible = "rockchip,rk3562-csi-dphy",
+		.data = &rk3562_mipidphy_drv_data,
+	},
+	{
 		.compatible = "rockchip,rk3568-csi-dphy",
 		.data = &rk3568_mipidphy_drv_data,
+	},
+	{
+		.compatible = "rockchip,rk3572-csi-dphy",
+		.data = &rk3572_mipidphy_drv_data,
+	},
+	{
+		.compatible = "rockchip,rk3588-csi-dphy",
+		.data = &rk3588_mipidphy_drv_data,
+	},
+	{
+		.compatible = "rockchip,rv1126b-csi-dphy",
+		.data = &rv1126b_mipidphy_drv_data,
 	},
 	{}
 };
@@ -402,7 +611,10 @@ static int rockchip_inno_csidphy_probe(struct platform_device *pdev)
 	struct rockchip_inno_csidphy *priv;
 	struct device *dev = &pdev->dev;
 	struct phy_provider *phy_provider;
+	struct resource *res;
 	struct phy *phy;
+	u32 phase;
+	int ret;
 
 	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
 	if (!priv)
@@ -417,6 +629,24 @@ static int rockchip_inno_csidphy_probe(struct platform_device *pdev)
 		return -ENODEV;
 	}
 
+	priv->continuous_clk = device_property_read_bool(dev,
+						       "rockchip,continuous-clock");
+	if (priv->continuous_clk && !priv->drv_data->clk_continuous_offset)
+		return dev_err_probe(dev, -EINVAL,
+				     "continuous clock mode is unsupported on this PHY\n");
+
+	priv->clk_phase = -1;
+	if (device_property_read_u32(dev, "rockchip,clk-lane-phase",
+				     &phase) == 0) {
+		if (phase > 7) {
+			dev_warn(dev,
+				 "invalid rockchip,clk-lane-phase %u, using default %u\n",
+				 phase, CSIDPHY_CLK_PHASE_DEFAULT);
+			phase = CSIDPHY_CLK_PHASE_DEFAULT;
+		}
+		priv->clk_phase = phase;
+	}
+
 	priv->grf = syscon_regmap_lookup_by_phandle(dev->of_node,
 						    "rockchip,grf");
 	if (IS_ERR(priv->grf)) {
@@ -424,9 +654,21 @@ static int rockchip_inno_csidphy_probe(struct platform_device *pdev)
 		return PTR_ERR(priv->grf);
 	}
 
-	priv->phy_base = devm_platform_ioremap_resource(pdev, 0);
+	priv->phy_base = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
 	if (IS_ERR(priv->phy_base))
 		return PTR_ERR(priv->phy_base);
+
+	priv->grf_regs = priv->drv_data->grf_regs;
+	for (unsigned int i = 0; i < priv->drv_data->num_instances; i++) {
+		if (priv->drv_data->instances[i].reg == res->start) {
+			priv->grf_regs = priv->drv_data->instances[i].grf_regs;
+			break;
+		}
+	}
+	if (!priv->grf_regs) {
+		dev_err(dev, "no GRF configuration for PHY at %pa\n", &res->start);
+		return -ENODEV;
+	}
 
 	priv->pclk = devm_clk_get(dev, "pclk");
 	if (IS_ERR(priv->pclk)) {
@@ -434,10 +676,18 @@ static int rockchip_inno_csidphy_probe(struct platform_device *pdev)
 		return PTR_ERR(priv->pclk);
 	}
 
-	priv->rst = devm_reset_control_get(dev, "apb");
-	if (IS_ERR(priv->rst)) {
+	if (priv->drv_data->resets_num > RESETS_MAX) {
+		dev_err(dev, "invalid number of resets\n");
+		return -EINVAL;
+	}
+	priv->resets_num = priv->drv_data->resets_num;
+	for (unsigned int i = 0; i < priv->resets_num; i++)
+		priv->resets[i].id = priv->drv_data->resets[i];
+	ret = devm_reset_control_bulk_get_exclusive(dev, priv->resets_num,
+						    priv->resets);
+	if (ret) {
 		dev_err(dev, "failed to get system reset control\n");
-		return PTR_ERR(priv->rst);
+		return ret;
 	}
 
 	phy = devm_phy_create(dev, NULL, &rockchip_inno_csidphy_ops);
@@ -464,7 +714,6 @@ static int rockchip_inno_csidphy_remove(struct platform_device *pdev)
 	struct rockchip_inno_csidphy *priv = platform_get_drvdata(pdev);
 
 	pm_runtime_disable(priv->dev);
-
 	return 0;
 }
 

@@ -1,0 +1,1 @@
+obj-$(CONFIG_VIDEO_ROCKCHIP_VICAP_LEAFKVM) += rk-vicap.o

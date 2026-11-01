@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config VIDEO_ROCKCHIP_VICAP_LEAFKVM
+	tristate "RV1126B MIPI CSI-2 receiver for the LeafKVM HDMI bridge"
+	depends on OF
+	depends on ARCH_ROCKCHIP || COMPILE_TEST
+	depends on ROCKCHIP_IOMMU
+	select DMA_SHARED_BUFFER
+	select GENERIC_PHY
+	help
+	  Character device /dev/vicap receiving the HDMI-to-CSI bridge's
+	  CSI-2 stream (D-PHY through the generic PHY API, DesignWare CSI-2
+	  host, one RV1126B VICAP MIPI path) into imported dma-bufs, with
+	  whole-frame or progressive (rows ready while the frame is still
+	  being captured) completion records.  Binds a device tree node
+	  "leafkvm,rv1126b-vicap" in place of the vendor rkcif, mipi-csi2 and
+	  csi2-dphy drivers.  No V4L2: the stream is agreed with the bridge in
+	  userspace.  See include/uapi/linux/rk-vicap.h.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called rk-vicap.
