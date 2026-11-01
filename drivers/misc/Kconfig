@@ -14,6 +14,7 @@ config RK803
 	  Driver for RK803 which is used for driving porjector and IR flood LED.
 
 source "drivers/misc/rk-vicap/Kconfig"
+source "drivers/misc/leafkvm-ddrmon/Kconfig"
 
 source "drivers/misc/rockchip/Kconfig"
 source "drivers/misc/vehicle/Kconfig"

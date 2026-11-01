@@ -1,0 +1,30 @@
+/dev/leafkvm-ddrmon is a read-only, shared sample of RV1126B DDR3 traffic.
+
+Each open/read returns one ASCII line:
+  1 read_bytes write_bytes elapsed_ns dram_clock_hz bus_width_bits sampled_ns
+
+Version 1. Byte counts span the same completed window, normally about 1 s.
+Times use CLOCK_MONOTONIC. The first sample and invalid/stale samples return
+EAGAIN. Multiple readers do not reset counters or change the sampling window.
+seq_file keeps partial reads coherent. No ioctl, mmap or write interface.
+
+bytes/s = bytes * 1e9 / elapsed_ns
+peak bytes/s = dram_clock_hz * 2 * bus_width_bits / 8
+bandwidth usage = (read bytes/s + write bytes/s) / peak bytes/s
+
+This is payload bandwidth relative to theoretical peak, NOT memory-controller
+busy time. Do not use the vendor DFI driver's uncorrected 4*access/count ratio:
+the DFI counter is half-rate on RV1126B. DDR3 BL8 transfers bus_width_bits
+bytes per command. Calibrated with large DMA-heap memory transfers.
+
+The module claims the disabled rockchip,rv1126b-dfi DT node's MMIO resource,
+uses its GRF phandle to validate DDR3/bus width, and gets the DDR and monitor
+clocks from the RV1126B CRU. No DT override or DMC/devfreq is required. It
+refuses active DFI/DMC nodes, occupied MMIO, active software/timer sampling,
+unsupported IP/DDR types or clocks above 1.2 GHz. It never sets DDR frequency.
+It enables only the monitor peripheral clock; original control/clock ownership
+is restored on unload. Suspend cancels sampling; resume starts a fresh window.
+
+Enabled by CONFIG_LEAFKVM_DDRMON=y in the RV1126B kernel config. Other machines
+report no DDR sample. Do not concurrently run raw /dev/mem monitor utilities; use this ABI
+for telemetry. Stop/unload the module before raw-counter calibration.

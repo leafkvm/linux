@@ -70,3 +70,4 @@ obj-$(CONFIG_GP_PCI1XXXX)	+= mchp_pci1xxxx/
 obj-$(CONFIG_VCPU_STALL_DETECTOR)	+= vcpu_stall_detector.o
 
 obj-$(CONFIG_VIDEO_ROCKCHIP_VICAP_LEAFKVM) += rk-vicap/
+obj-$(CONFIG_LEAFKVM_DDRMON) += leafkvm-ddrmon/
