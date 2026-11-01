@@ -11,5 +11,4 @@ obj-y += hdmirx/
 obj-y += ooc/
 obj-y += rga/
 obj-y += rkisp1/
-obj-y += vicap/
 obj-y += vpss/
