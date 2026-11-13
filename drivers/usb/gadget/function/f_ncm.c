@@ -1160,8 +1160,17 @@ static enum hrtimer_restart ncm_tx_timeout(struct hrtimer *data)
 		 * XXX interface.
 		 *
 		 * This will call directly into u_ether's eth_start_xmit()
+		 *
+		 * It returns NETDEV_TX_BUSY without sending anything when all IN
+		 * requests are in flight. The open NTB is then still pending, and
+		 * nothing else would flush it: this timer is only started when a
+		 * new NTB is begun, and the datagrams added later stay in it until
+		 * it is full. Try again after another timeout instead.
 		 */
-		netdev->netdev_ops->ndo_start_xmit(NULL, netdev);
+		if (netdev->netdev_ops->ndo_start_xmit(NULL, netdev) == NETDEV_TX_BUSY) {
+			hrtimer_forward_now(data, TX_TIMEOUT_NSECS);
+			return HRTIMER_RESTART;
+		}
 	}
 	return HRTIMER_NORESTART;
 }
