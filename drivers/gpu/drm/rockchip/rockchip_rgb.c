@@ -691,14 +691,7 @@ static int rockchip_mcu_panel_init(struct rockchip_rgb *rgb)
 	 * A missing marker/sequence or an asserted reset uses the cold path.
 	 */
 	data = of_get_property(np_mcu_panel, "panel-handoff-sequence", &len);
-	if (data && len > 0 &&
-	    of_property_read_bool(np_mcu_panel, "boot-panel-initialized") &&
-	    !of_property_read_string(np_mcu_panel, "boot-panel-compatible", &boot_panel) &&
-	    !strcmp(boot_panel, "st7789-rgb666-v1") &&
-	    gpiod_get_direction(mcu_panel->reset_gpio) == 0 &&
-	    gpiod_get_value_cansleep(mcu_panel->reset_gpio) == 0 &&
-	    (!mcu_panel->enable_gpio ||
-	     gpiod_get_value_cansleep(mcu_panel->enable_gpio) == 1)) {
+	if (data && len > 0) {
 		mcu_panel->desc->handoff_seq = devm_kzalloc(dev,
 					sizeof(*mcu_panel->desc->handoff_seq), GFP_KERNEL);
 		if (!mcu_panel->desc->handoff_seq)
@@ -708,10 +701,19 @@ static int rockchip_mcu_panel_init(struct rockchip_rgb *rgb)
 						     mcu_panel->desc->handoff_seq);
 		if (ret < 0) {
 			dev_warn(dev, "invalid panel handoff sequence; using full initialization\n");
-		} else {
-			mcu_panel->bootloader_initialized = true;
-			mcu_panel->prepared = true;
+			mcu_panel->desc->handoff_seq = NULL;
 		}
+	}
+	if (mcu_panel->desc->handoff_seq &&
+	    of_property_read_bool(np_mcu_panel, "boot-panel-initialized") &&
+	    !of_property_read_string(np_mcu_panel, "boot-panel-compatible", &boot_panel) &&
+	    !strcmp(boot_panel, "st7789-rgb666-v1") &&
+	    gpiod_get_direction(mcu_panel->reset_gpio) == 0 &&
+	    gpiod_get_value_cansleep(mcu_panel->reset_gpio) == 0 &&
+	    (!mcu_panel->enable_gpio ||
+	     gpiod_get_value_cansleep(mcu_panel->enable_gpio) == 1)) {
+		mcu_panel->bootloader_initialized = true;
+		mcu_panel->prepared = true;
 	}
 
 	/*
@@ -894,8 +896,20 @@ static int rockchip_mcu_panel_enable(struct drm_panel *panel)
 	bool inherited = mcu_panel->bootloader_initialized;
 	int ret = 0;
 
-	if (mcu_panel->enabled)
+	if (mcu_panel->enabled) {
+		/*
+		 * The panel kept running while its crtc was detached
+		 * (rockchip_rgb_encoder_atomic_disable leaves it alone then),
+		 * but the stream was cut mid-frame: an MCU panel has no frame
+		 * sync, so its write pointer is anywhere. The handoff sequence
+		 * (window + RAMWR) puts it back at the frame start; the panel
+		 * stays awake, so TE keeps pacing the VOP.
+		 */
+		if (mcu_panel->desc->handoff_seq &&
+		    rockchip_mcu_panel_xfer_mcu_cmd_seq(mcu_panel, mcu_panel->desc->handoff_seq))
+			DRM_DEV_ERROR(panel->dev, "failed to send handoff cmds seq\n");
 		return 0;
+	}
 
 	dev_dbg(panel->dev, "%s MCU panel sequence\n",
 		inherited ? "handoff" : "full initialization");

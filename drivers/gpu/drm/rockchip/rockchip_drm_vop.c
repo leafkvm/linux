@@ -359,6 +359,8 @@ struct vop {
 
 	struct rockchip_mcu_timing mcu_timing;
 	struct rockchip_mcu_timing mcu_bypass_timing;
+	/* TE must not start an MCU frame: bypass commands are coming */
+	bool mcu_frames_gated;
 
 	/**
 	 * @wb_en: write back enabled
@@ -3684,6 +3686,33 @@ static void vop_mcu_mode_setup(struct drm_crtc *crtc)
 	VOP_CTRL_SET(vop, mcu_rw_pend, vop->mcu_timing.mcu_rw_pend);
 }
 
+static u32 vop_mcu_frame_idle(struct vop *vop)
+{
+	/* mcu_frame_st reads back the HOLD status: 1 = no frame in flight */
+	return VOP_CTRL_GET(vop, mcu_frame_st);
+}
+
+/*
+ * An MCU panel has no frame sync: it takes the pixels where its own
+ * write pointer is. Switching to bypass mode while a frame is being
+ * sent cuts it, and the VOP sends the rest after the bypass commands,
+ * shifting the panel by pixels and bytes. So stop TE from starting
+ * frames and let the one in flight finish first.
+ */
+static void vop_mcu_wait_frame_idle(struct vop *vop)
+{
+	u32 idle;
+
+	WRITE_ONCE(vop->mcu_frames_gated, true);
+	smp_mb();
+	/* a TE handler already past the gate has set mcu_frame_st by now */
+	udelay(20);
+	if (!vop->is_enabled || !VOP_CTRL_GET(vop, mcu_hold_mode))
+		return;
+	if (readx_poll_timeout(vop_mcu_frame_idle, vop, idle, idle, 100, 50 * 1000))
+		DRM_DEV_ERROR(vop->dev, "MCU frame still in flight before bypass\n");
+}
+
 static void vop_crtc_send_mcu_cmd(struct drm_crtc *crtc, u32 type, u32 value)
 {
 	struct drm_display_mode *adjusted_mode;
@@ -3701,8 +3730,10 @@ static void vop_crtc_send_mcu_cmd(struct drm_crtc *crtc, u32 type, u32 value)
 		 * 1.set mcu bypass mode timing.
 		 * 2.set dclk rate to 150M.
 		 */
-		if ((type == MCU_SETBYPASS) && value)
+		if ((type == MCU_SETBYPASS) && value) {
+			vop_mcu_wait_frame_idle(vop);
 			vop_mcu_bypass_mode_setup(crtc);
+		}
 	}
 
 	mutex_lock(&vop->vop_lock);
@@ -3744,6 +3775,8 @@ static void vop_crtc_send_mcu_cmd(struct drm_crtc *crtc, u32 type, u32 value)
 		if ((type == MCU_SETBYPASS) && !value) {
 			vop_mcu_mode_setup(crtc);
 			clk_set_rate(vop->dclk, adjusted_mode->crtc_clock * 1000);
+			smp_mb();
+			WRITE_ONCE(vop->mcu_frames_gated, false);
 		}
 	}
 }
@@ -3792,6 +3825,8 @@ static void vop_crtc_te_handler(struct drm_crtc *crtc)
 	vop = to_vop(crtc);
 
 	if (vop->mcu_timing.mcu_pix_total) {
+		if (READ_ONCE(vop->mcu_frames_gated))
+			return;
 		if (VOP_CTRL_GET(vop, mcu_bypass)) {
 			// When sending MCU init sequence, the panel might sent TE signal even
 			// before the init sequence is done. This will result in mcu_frame_st set
