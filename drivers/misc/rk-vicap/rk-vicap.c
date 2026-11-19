@@ -27,7 +27,27 @@
  *  - DMA self-adapt off and crop on: the DMA writes at most the configured
  *    rows of the configured width, whatever the source sends.  A source that
  *    changes without telling userspace therefore only produces aborted
- *    frames (size error, timeout), never writes outside a buffer's frame.
+ *    frames (size error, timeout), never writes outside a buffer's frame;
+ *  - the SET_SIZE width must be a multiple of 4: one that is not (1366)
+ *    acts as rounded down, with a size error in every frame.  So every
+ *    width is programmed rounded up to 4 (measured with 1366-wide RGB888
+ *    and YUV422 sources and widths 1361..1366): every row lands at its
+ *    place and the frames complete.  RGB888 stores the source pixels up to
+ *    the rounded width, then zero pixels (SIZE_NUM reads 1366 against 1368,
+ *    a size error at every line end).  The YUV422_8 parser stores only a
+ *    multiple of 4 of the source pixels (1364 of 1366, for NV16, NV61, NV12
+ *    and NV21 alike; the bridge does send all 1366, a RAW8 capture holds
+ *    them), then zero luma and chroma, with a size error at the first line
+ *    end.  That size error is expected, so it is not enabled when the width
+ *    is not a multiple of 4; a source change shows in the bridge report and
+ *    the frame watchdog instead;
+ *  - the DMA writes each row in 8-byte units (a 1364 x 3 = 4092-byte row
+ *    writes 4 more zero bytes), so stride and plane offset are multiples of
+ *    8 and the stride holds the rounded row: the tail stays in the frame;
+ *  - any height: with uvds (NV12/NV21 from YUV422) an odd height leaves
+ *    the last chroma row unwritten (767 rows write 383 of 384).
+ *    YUV420_8_LEGACY is not measured (no source sends it); it takes the
+ *    same rules, which keep its writes inside the frame.
  */
 #include <linux/clk.h>
 #include <linux/delay.h>
@@ -156,7 +176,7 @@ struct vicap_fmt {
 	u8 order;	/* CTRL0 sw_out_order */
 	u8 bpp;		/* bytes per pixel of plane 0 */
 	u8 planes;
-	u8 uv_vsub;	/* plane 1 rows = height / uv_vsub */
+	u8 uv_vsub;	/* plane 1 rows = height / uv_vsub, rounded up */
 	bool uvds;	/* average chroma of row pairs (YUV422 -> 420) */
 };
 
@@ -609,6 +629,15 @@ static void hw_quiesce(struct vicap *v)
 	writel(~0u, v->base + GLB_INTST);
 }
 
+/*
+ * Pixels per row the DMA writes: the width rounded up to the SET_SIZE
+ * granule (see the hardware model above).
+ */
+static u32 hw_width(const struct vicap_format *c)
+{
+	return ALIGN(c->width, 4);
+}
+
 /* program the path for v->fmt and start it; slots already armed */
 static void hw_program(struct vicap *v)
 {
@@ -632,14 +661,15 @@ static void hw_program(struct vicap *v)
 	m_write(v, M_CTRL, m_read(v, M_CTRL) | CTRL_SOFT_RST_BITS);
 	m_write(v, M_CTRL, m_read(v, M_CTRL) & ~CTRL_SOFT_RST_MASK);
 
-	m_write(v, M_SET_SIZE, c->width | c->height << 16);
+	m_write(v, M_SET_SIZE, hw_width(c) | c->height << 16);
 	m_write(v, M_CROP_START, 0);
 	m_write(v, M_VLW, c->stride | VLW_FORCE_UPDATE);
 	m_write(v, M_CTRL1, (debug_dt ? debug_dt : f->dt) << 4 |
 		c->virtual_channel);
 
-	inten = INT_FS | INT_DMA_ENDS | INT_SIZE_ERR | INT_OVERFLOWS |
-		INT_BW_LACK;
+	inten = INT_FS | INT_DMA_ENDS | INT_OVERFLOWS | INT_BW_LACK;
+	if (hw_width(c) == c->width)
+		inten |= INT_SIZE_ERR;
 	if (c->progress_step)
 		inten |= INT_LINE;
 
@@ -944,16 +974,14 @@ static int set_format(struct vicap *v, struct vicap_format *c)
 	    (c->fps_num && !c->fps_den))
 		return -EINVAL;
 	f = find_fmt(c->fourcc, c->data_type);
-	if (!f || !c->width || c->width % 4 || c->width > 8192 ||
+	if (!f || !c->width || c->width > 8192 ||
 	    !c->height || c->height > 8192)
 		return -EINVAL;
-	uv_rows = f->planes == 2 ? c->height / f->uv_vsub : 0;
-	if (f->uv_vsub == 2 && (c->height % 2 || c->progress_step % 2))
-		return -EINVAL;
+	uv_rows = f->planes == 2 ? DIV_ROUND_UP(c->height, f->uv_vsub) : 0;
 	if (c->progress_step > min_t(u32, c->height, LINE_CNT_MASK))
 		return -EINVAL;
 
-	row = c->width * f->bpp;
+	row = hw_width(c) * f->bpp;
 	if (!c->stride)
 		c->stride = ALIGN(c->width, 128) * f->bpp;
 	if (c->stride < row || c->stride % 8 || c->stride >= BIT(20))

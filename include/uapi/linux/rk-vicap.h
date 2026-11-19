@@ -44,7 +44,8 @@
  * before the record is produced.  Frames are written as
  *   plane 0 row r at  r * stride
  *   plane 1 row r at  uv_offset + r * stride     (NV12/NV16 only)
- * and never beyond the configured width, height and @size, whatever arrives.
+ * and never beyond the row (see @stride), the configured height and @size,
+ * whatever arrives.
  * CPU access is bracketed with DMA_BUF_IOCTL_SYNC as for every dma-buf.
  *
  * Records.  read() returns whole struct vicap_record entries.  The kernel
@@ -102,7 +103,13 @@ struct vicap_caps {
 
 /**
  * struct vicap_format - link, memory layout and mode (VICAP_IOC_SET_FORMAT)
- * @width, @height: frame size.  Width is a multiple of 4.
+ * @width, @height: frame size, any from 1 to 8192.  The DMA writes each
+ *              row rounded up to 4 pixels, which the stride must hold; the
+ *              pixels after the source's are zero.  With the YUV422_8 data
+ *              type a source width of 4n + 2 also loses its last 2 pixels
+ *              (zero, the receiver drops them), and with NV12/NV21 the last
+ *              row of an odd height gets no chroma (the buffer keeps what it
+ *              held).
  * @fourcc:     V4L2_PIX_FMT_* memory format, with the data types it takes:
  *                BGR24 (bytes B,G,R) / RGB24 / YUV24 (bytes Y,U,V)  RGB888
  *                NV16 / NV61                                        YUV422_8
@@ -110,18 +117,22 @@ struct vicap_caps {
  *                              over row pairs, or from YUV420)      YUV420_8_LEGACY
  * @stride:     in: bytes per row of both planes, 0 for the default
  *              (width rounded up to 128 pixels times the bytes per pixel of
- *              plane 0); otherwise a multiple of 8 and at least the row.
+ *              plane 0); otherwise a multiple of 8 and at least the row
+ *              (width rounded up to 4 pixels): the DMA writes rows in
+ *              8-byte units.
  *              out: the stride used.
  * @uv_offset:  in: offset of plane 1, 0 for stride * height; otherwise a
  *              multiple of 8 and at least that.  out: the offset used, 0 for
  *              single-plane formats.
  * @size:       out: minimum buffer size.
  * @planes:     out: 1 or 2.
- * @uv_height:  out: rows of plane 1 (height or height / 2), 0 if none.
+ * @uv_height:  out: rows of plane 1 (height or height / 2 rounded up), 0 if
+ *              none.
  * @data_type:  in: CSI-2 data type of the stream (VICAP_DT_*).
  * @progress_step: 0: whole-frame mode, only DONE/ABORTED records.
  *              n > 0: progressive mode, CAPTURING records at frame start
- *              (rows 0) and every n received rows.  Even for NV12/NV21.
+ *              (rows 0) and every n received rows.  With NV12/NV21 the
+ *              chroma of an odd count's last row can still be missing.
  * @virtual_channel: in: CSI-2 virtual channel, 0..3.
  * @lanes:      in: data lanes the transmitter uses, 0 for all wired lanes.
  *              out: the lanes used.
