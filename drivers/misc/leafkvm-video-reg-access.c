@@ -2,7 +2,8 @@
 /*
  * LeafKVM I2C register access driver
  *
- * Exposes read_reg / write_reg via ioctl on a /dev/<chip> misc device.
+ * Exposes read_reg / write_reg / read_block via ioctl on a /dev/<chip> misc
+ * device.
  */
 
 #include <linux/module.h>
@@ -20,11 +21,26 @@
 #define VIDEO_CHIP_IOC_MAGIC		'L'
 #define VIDEO_CHIP_IOC_READ_REG		_IOWR(VIDEO_CHIP_IOC_MAGIC, 0, struct video_chip_reg_op)
 #define VIDEO_CHIP_IOC_WRITE_REG	_IOW(VIDEO_CHIP_IOC_MAGIC, 1, struct video_chip_reg_op)
+#define VIDEO_CHIP_IOC_READ_BLOCK	_IOWR(VIDEO_CHIP_IOC_MAGIC, 2, struct video_chip_block_op)
+
+/* Longest block read; a block also may not cross a register page. */
+#define VIDEO_CHIP_BLOCK_MAX		64
 
 struct video_chip_reg_op {
 	__u16 reg;
 	__u8  val;
 	__u8  _pad;
+};
+
+/*
+ * Read len consecutive registers from reg in one I2C transaction, so they come
+ * from (nearly) the same instant. This relies on the chip auto-incrementing
+ * the register address during a read, as the LT6911C (0x2102) does.
+ */
+struct video_chip_block_op {
+	__u16 reg;
+	__u16 len;
+	__u8  val[VIDEO_CHIP_BLOCK_MAX];
 };
 
 struct video_chip_variant;
@@ -56,7 +72,8 @@ static int video_chip_write_reg_direct(struct video_chip_data *chip, u8 reg, u8 
 	return i2c_transfer(chip->client->adapter, &msg, 1) == 1 ? 0 : -EIO;
 }
 
-static int video_chip_read_reg_direct(struct video_chip_data *chip, u8 reg, u8 *val)
+static int video_chip_read_direct(struct video_chip_data *chip, u8 reg, u8 *val,
+				  u16 len)
 {
 	struct i2c_msg msgs[2] = {
 		{
@@ -68,7 +85,7 @@ static int video_chip_read_reg_direct(struct video_chip_data *chip, u8 reg, u8 *
 		{
 			.addr  = chip->client->addr,
 			.flags = I2C_M_RD,
-			.len   = 1,
+			.len   = len,
 			.buf   = val,
 		},
 	};
@@ -102,17 +119,26 @@ static int video_chip_write_reg(struct video_chip_data *chip, u16 reg, u8 val)
 	return video_chip_write_reg_direct(chip, reg_addr, val);
 }
 
-static int video_chip_read_reg(struct video_chip_data *chip, u16 reg, u8 *val)
+static int video_chip_read_block(struct video_chip_data *chip, u16 reg, u8 *val,
+				 u16 len)
 {
 	int ret;
 	u8 page     = reg >> 8;
 	u8 reg_addr = reg & 0xFF;
 
+	if (len == 0 || len > VIDEO_CHIP_BLOCK_MAX || reg_addr + len > 0x100)
+		return -EINVAL;
+
 	ret = video_chip_ensure_page(chip, page);
 	if (ret)
 		return ret;
 
-	return video_chip_read_reg_direct(chip, reg_addr, val);
+	return video_chip_read_direct(chip, reg_addr, val, len);
+}
+
+static int video_chip_read_reg(struct video_chip_data *chip, u16 reg, u8 *val)
+{
+	return video_chip_read_block(chip, reg, val, 1);
 }
 
 /* Reset ------------------------------------------------------------------ */
@@ -233,11 +259,31 @@ static int video_chip_release(struct inode *inode, struct file *f)
 	return 0;
 }
 
+static long video_chip_ioctl_block(struct video_chip_data *chip, unsigned long arg)
+{
+	struct video_chip_block_op op;
+	int ret;
+
+	if (copy_from_user(&op, (void __user *)arg, sizeof(op)))
+		return -EFAULT;
+
+	mutex_lock(&chip->lock);
+	ret = video_chip_read_block(chip, op.reg, op.val, op.len);
+	mutex_unlock(&chip->lock);
+
+	if (ret == 0 && copy_to_user((void __user *)arg, &op, sizeof(op)))
+		ret = -EFAULT;
+	return ret;
+}
+
 static long video_chip_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 {
 	struct video_chip_data *chip = file_to_chip(f);
 	struct video_chip_reg_op op;
 	int ret;
+
+	if (cmd == VIDEO_CHIP_IOC_READ_BLOCK)
+		return video_chip_ioctl_block(chip, arg);
 
 	if (copy_from_user(&op, (void __user *)arg, sizeof(op)))
 		return -EFAULT;
